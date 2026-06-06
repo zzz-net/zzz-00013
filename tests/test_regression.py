@@ -1175,6 +1175,163 @@ def test_doctor_history_after_restart_and_export_by_id() -> None:
         _assert(data["doctor_id"] == did, f"导出的 ID 不匹配: {data['doctor_id']} vs {did}")
 
 
+def test_handover_create_success() -> None:
+    """handover-create 成功生成：含 manifest.json/csv、README、报告副本、files/，记录持久化。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        out_dir = ws / "handover_pkg"
+        r = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(out_dir))
+        _assert(r.returncode == 0, f"handover-create failed (exit={r.returncode}): {r.stderr}\nstdout={r.stdout}")
+        _assert("交接包已生成" in r.stdout, f"未输出成功提示: {r.stdout}")
+        _assert(out_dir.exists(), f"输出目录未创建: {out_dir}")
+
+        for fname in ("manifest.json", "manifest.csv", "README.txt"):
+            p = out_dir / fname
+            _assert(p.exists() and p.stat().st_size > 0, f"{fname} 未生成或为空")
+
+        report_files = list(out_dir.glob("batch_report_*.txt"))
+        _assert(len(report_files) >= 1, "批次报告副本未生成")
+
+        files_subdir = out_dir / "files"
+        _assert(files_subdir.exists(), "files/ 子目录未生成")
+        photo_count = sum(1 for _ in files_subdir.rglob("*") if _.is_file())
+        _assert(photo_count >= 8, f"files/ 内照片数量异常: {photo_count}")
+
+        r2 = _run_cli(ws, "handover-list", "-c", "config.yaml")
+        _assert(r2.returncode == 0, f"handover-list failed: {r2.stderr}")
+        _assert("handover_" in r2.stdout, f"list 未显示生成的交接包: {r2.stdout}")
+
+
+def test_handover_duplicate_dir_auto_suffix() -> None:
+    """同名输出目录冲突：自动加序号，不覆盖已有内容，原目录内容保留。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        out_dir = ws / "handover_pkg"
+        marker_file = out_dir / "SHOULD_NOT_BE_OVERWRITTEN.txt"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        marker_file.write_text("original content", encoding="utf-8")
+        original_mtime = marker_file.stat().st_mtime
+
+        r = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(out_dir))
+        _assert(r.returncode == 0, f"冲突目录应自动重命名: {r.stderr}")
+        _assert("自动改用" in r.stdout or "已自动改用" in r.stdout,
+                f"未提示自动重命名: {r.stdout}")
+
+        _assert(marker_file.exists() and marker_file.read_text(encoding="utf-8") == "original content",
+                "原目录内容被覆盖！")
+        _assert(marker_file.stat().st_mtime == original_mtime, "原目录标记文件 mtime 被改动")
+
+        alt_dir = ws / "handover_pkg_1"
+        _assert(alt_dir.exists() and (alt_dir / "manifest.json").exists(),
+                f"重命名后的目录 {alt_dir} 不存在或未生成 manifest.json")
+
+
+def test_handover_history_persistence() -> None:
+    """交接包历史持久化：子进程 A 创建，子进程 B handover-list/show 可查。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "run", "-c", "config.yaml")
+
+        r1 = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(ws / "pkg_a"))
+        _assert(r1.returncode == 0, f"create #1 failed: {r1.stderr}")
+        import re
+        m = re.search(r"交接包 ID:\s*(handover_\S+)", r1.stdout)
+        _assert(m is not None, f"无法从输出解析 handover_id: {r1.stdout}")
+        hid1 = m.group(1)
+
+        r2 = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(ws / "pkg_b"))
+        _assert(r2.returncode == 0, f"create #2 failed: {r2.stderr}")
+
+        r3 = _run_cli(ws, "handover-list", "-c", "config.yaml")
+        _assert(r3.returncode == 0, f"handover-list failed: {r3.stderr}")
+        lines = [l for l in r3.stdout.splitlines() if l.strip().startswith("handover_")]
+        _assert(len(lines) >= 2, f"history 应至少 2 条，实际 {len(lines)} 条:\n{r3.stdout}")
+
+        r4 = _run_cli(ws, "handover-show", "-c", "config.yaml", "-d", hid1)
+        _assert(r4.returncode == 0, f"handover-show failed: {r4.stderr}")
+        _assert("交接包 ID: " + hid1 in r4.stdout, f"show 未显示目标 ID: {r4.stdout}")
+        _assert("文件列表" in r4.stdout, f"show 未显示文件列表: {r4.stdout}")
+
+
+def test_handover_verify_missing_file_fails() -> None:
+    """handover-verify 删除包内文件后，校验失败并以非 0 退出。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "run", "-c", "config.yaml")
+
+        out_dir = ws / "handover_pkg"
+        r = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(out_dir))
+        _assert(r.returncode == 0, f"create failed: {r.stderr}")
+
+        files_subdir = out_dir / "files"
+        victims = [p for p in files_subdir.rglob("*") if p.is_file()]
+        _assert(len(victims) >= 1, "交接包内无文件可删")
+        victims[0].unlink()
+        _assert(not victims[0].exists(), "删除失败")
+
+        r2 = _run_cli(ws, "handover-verify", "-c", "config.yaml")
+        _assert(r2.returncode != 0,
+                f"缺失文件时 verify 应 exit!=0，实际 exit={r2.returncode}\nstdout={r2.stdout}\nstderr={r2.stderr}")
+        _assert("交接包内文件缺失" in r2.stdout or "package_file_missing" in r2.stdout
+                or "[ERROR]" in r2.stdout,
+                f"verify 应报告文件缺失: {r2.stdout}")
+
+
+def test_handover_manifest_json_csv_content() -> None:
+    """manifest.json/csv 内容：字段完整、可解析、哈希可复算、条目数一致。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "run", "-c", "config.yaml")
+
+        out_dir = ws / "handover_pkg"
+        r = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(out_dir))
+        _assert(r.returncode == 0, f"create failed: {r.stderr}")
+
+        json_path = out_dir / "manifest.json"
+        data = json.loads(json_path.read_text(encoding="utf-8"))
+        for top_key in ("handover_id", "batch", "summary", "files"):
+            _assert(top_key in data, f"manifest.json 缺少顶层字段 {top_key}")
+        _assert(data["batch"]["batch_id"].startswith("batch_"), "batch_id 格式异常")
+        _assert(isinstance(data["files"], list) and len(data["files"]) >= 8,
+                f"manifest.json files 异常: {type(data.get('files'))}, len={len(data.get('files', []))}")
+
+        for fe in data["files"]:
+            for k in ("idx", "source", "archive_path", "relative_path", "file_size", "sha256"):
+                _assert(k in fe, f"manifest.json file entry 缺少字段 {k}: {fe}")
+
+        sample = data["files"][0]
+        fpath = out_dir / sample["relative_path"]
+        _assert(fpath.exists(), f"manifest 中引用的文件不存在: {sample['relative_path']}")
+        import hashlib
+        h = hashlib.sha256()
+        with open(fpath, "rb") as f:
+            while True:
+                ch = f.read(1024 * 1024)
+                if not ch:
+                    break
+                h.update(ch)
+        _assert(h.hexdigest() == sample["sha256"],
+                f"SHA-256 不匹配: expected={sample['sha256']}, actual={h.hexdigest()}")
+        _assert(fpath.stat().st_size == sample["file_size"],
+                f"file_size 不匹配: expected={sample['file_size']}, actual={fpath.stat().st_size}")
+
+        csv_path = out_dir / "manifest.csv"
+        text = csv_path.read_text(encoding="utf-8-sig")
+        rows = list(csv.reader(io.StringIO(text)))
+        _assert(len(rows) >= 2, "CSV 行数太少")
+        header = rows[0]
+        for stable in ("idx", "source", "archive_path", "relative_path", "file_size", "sha256"):
+            _assert(stable in header, f"CSV 表头缺少稳定字段 {stable}: {header}")
+        _assert(len(rows) - 1 == len(data["files"]),
+                f"CSV 数据行数 ({len(rows) - 1}) 与 JSON files ({len(data['files'])}) 不一致")
+
+
 def main() -> int:
     tests = [
         ("跨进程持久化: list/show/export", test_cross_process_persistence),
@@ -1212,6 +1369,11 @@ def main() -> int:
         ("体检: doctor-export --json/--csv stdout 纯输出", test_doctor_export_stdout_pure_json_csv),
         ("体检: 同一秒多次运行记录名不冲突", test_doctor_same_second_name_collision),
         ("体检: history 与按 ID 导出", test_doctor_history_after_restart_and_export_by_id),
+        ("交接包: 创建成功 + 含所有必需文件", test_handover_create_success),
+        ("交接包: 同名目录自动加序号不覆盖", test_handover_duplicate_dir_auto_suffix),
+        ("交接包: 跨进程/重启历史持久化 + list/show", test_handover_history_persistence),
+        ("交接包: verify 缺文件失败 + 非 0 退出", test_handover_verify_missing_file_fails),
+        ("交接包: manifest JSON/CSV 字段完整 + 哈希可复算", test_handover_manifest_json_csv_content),
     ]
     failed = 0
     for name, fn in tests:

@@ -78,8 +78,16 @@ from .rollback import (
     format_template_show,
     rollback_batch,
 )
-from .storage import DoctorStore, StateStore, TemplateStore, TemplateError
+from .storage import DoctorStore, StateStore, TemplateStore, TemplateError, HandoverStore
 from .auditor import Auditor, AuditResult
+from .handover import (
+    HandoverError,
+    create_handover,
+    format_handover_list,
+    format_handover_show,
+    format_verify_result,
+    verify_handover,
+)
 
 
 def _resolve_config_path(config: str) -> Path:
@@ -992,6 +1000,152 @@ def doctor_export_cmd(
         sys.exit(1)
 
     click.echo(f"已导出体检报告 [{actual_fmt.upper()}] 到: {out}")
+
+
+@main.command("handover-create")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
+@click.option("-b", "--batch", "batch_id", default=None, help="批次 ID，不指定则使用最近一次 run 批次")
+@click.option("-o", "--output", "output_dir", required=True, help="交接包输出目录（已存在时自动追加序号）")
+def handover_create_cmd(config_path: str, batch_id: str, output_dir: str) -> None:
+    """生成归档交接包（离线包，含 manifest、报告副本和 README）"""
+    try:
+        cfg = _load_and_validate(config_path)
+    except click.ClickException as e:
+        click.echo(f"错误: {e}", err=True)
+        sys.exit(1)
+
+    store = StateStore(cfg.state_dir)
+    handover_store = HandoverStore(cfg.state_dir)
+
+    if not batch_id:
+        batch_id = store.get_last_batch_id()
+        if not batch_id:
+            click.echo("错误: 未找到任何批次记录", err=True)
+            sys.exit(1)
+        click.echo(f"使用最近一次批次: {batch_id}")
+
+    batch = store.get_batch(batch_id)
+    if batch is None:
+        click.echo(f"错误: 批次不存在: {batch_id}", err=True)
+        sys.exit(1)
+
+    try:
+        record, actual_dir = create_handover(
+            state_store=store,
+            handover_store=handover_store,
+            batch=batch,
+            output_dir=Path(output_dir),
+            archive_dir=cfg.archive_dir,
+        )
+    except HandoverError as e:
+        click.echo(f"错误: {e}", err=True)
+        sys.exit(11)
+    except Exception as e:
+        click.echo(f"错误: 生成交接包失败 - {e}", err=True)
+        sys.exit(1)
+
+    if str(actual_dir.resolve()) != str(Path(output_dir).resolve()):
+        click.echo(f"提示: 输出目录已存在，已自动改用: {actual_dir}")
+
+    click.echo(f"交接包已生成: {actual_dir}")
+    click.echo(f"交接包 ID: {record.handover_id}")
+    click.echo(f"对应批次:   {record.batch_id}")
+    click.echo(f"文件数量:   {len(record.files)}")
+    click.echo("")
+    click.echo("包内文件:")
+    for name in ("manifest.json", "manifest.csv", "README.txt"):
+        p = actual_dir / name
+        if p.exists():
+            click.echo(f"  {name}  ({p.stat().st_size} bytes)")
+    report_files = sorted(actual_dir.glob("batch_report_*"))
+    for rf in report_files:
+        click.echo(f"  {rf.name}  ({rf.stat().st_size} bytes)")
+    files_subdir = actual_dir / "files"
+    if files_subdir.exists():
+        photo_count = sum(1 for _ in files_subdir.rglob("*") if _.is_file())
+        click.echo(f"  files/    ({photo_count} 个文件)")
+
+
+@main.command("handover-list")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
+@click.option("-n", "--limit", type=int, default=20, help="显示最近 N 条")
+def handover_list_cmd(config_path: str, limit: int) -> None:
+    """列出历史交接包记录（跨重启可查）"""
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        click.echo(f"错误: 加载配置失败 - {e}", err=True)
+        sys.exit(1)
+
+    store = HandoverStore(cfg.state_dir)
+    ids = store.list_handovers()[:limit]
+    records = [r for r in (store.get_handover(i) for i in ids) if r is not None]
+
+    click.echo(f"状态目录: {cfg.state_dir}")
+    click.echo(f"交接包记录存储: {store.handovers_dir}")
+    click.echo(f"共 {len(ids)} 个交接包（显示最近 {len(records)} 个）:")
+    click.echo("")
+    click.echo(format_handover_list(records))
+
+
+@main.command("handover-show")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
+@click.option("-d", "--handover", "handover_id", default=None, help="交接包 ID，不指定则使用最近一次")
+def handover_show_cmd(config_path: str, handover_id: str) -> None:
+    """查看交接包详情及包内文件列表"""
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        click.echo(f"错误: 加载配置失败 - {e}", err=True)
+        sys.exit(1)
+
+    store = HandoverStore(cfg.state_dir)
+
+    if not handover_id:
+        handover_id = store.get_last_handover_id()
+        if not handover_id:
+            click.echo("错误: 未找到任何交接包记录", err=True)
+            sys.exit(1)
+        click.echo(f"使用最近一次交接包: {handover_id}")
+
+    record = store.get_handover(handover_id)
+    if record is None:
+        click.echo(f"错误: 交接包不存在: {handover_id}", err=True)
+        sys.exit(1)
+
+    click.echo(format_handover_show(record))
+
+
+@main.command("handover-verify")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
+@click.option("-d", "--handover", "handover_id", default=None, help="交接包 ID，不指定则使用最近一次")
+def handover_verify_cmd(config_path: str, handover_id: str) -> None:
+    """校验交接包：验证清单内文件、哈希、源/归档路径是否匹配"""
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        click.echo(f"错误: 加载配置失败 - {e}", err=True)
+        sys.exit(1)
+
+    store = HandoverStore(cfg.state_dir)
+
+    if not handover_id:
+        handover_id = store.get_last_handover_id()
+        if not handover_id:
+            click.echo("错误: 未找到任何交接包记录", err=True)
+            sys.exit(1)
+        click.echo(f"使用最近一次交接包: {handover_id}")
+
+    record = store.get_handover(handover_id)
+    if record is None:
+        click.echo(f"错误: 交接包不存在: {handover_id}", err=True)
+        sys.exit(1)
+
+    result = verify_handover(record)
+    click.echo(format_verify_result(result))
+
+    if result.has_errors:
+        sys.exit(12)
 
 
 if __name__ == "__main__":

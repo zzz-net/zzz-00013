@@ -9,6 +9,8 @@
 - **rollback 回滚**：按批次撤销，检测目标是否被其他文件占用
 - **持久化状态**：`list`/`show`/`export` 关闭终端后仍可查看历史批次、配置摘要和日志
 - **严格错误处理**：源目录不存在、两行落到同一归档名、重复执行已完成批次、回滚目标被占用 → 必须失败并说明原因
+- **配置体检 doctor**：`doctor` 在 dry-run/run 前检查 YAML 和 CSV，结果按 error/warn/info 分级，存在 error 时非 0 退出；历史持久化可查、可导出 JSON/CSV
+- **归档交接包 handover**：巡检照片归档完成后，把某个批次整理成可交给外部人员核对的离线包（含 manifest.json/csv、批次报告副本和 README.txt）；历史持久化可查，支持校验包内文件哈希与源路径
 
 ## 安装
 
@@ -330,6 +332,137 @@ python -m patrol_archiver dry-run -c from_template.yaml
 
 ---
 
+---
+
+## 归档交接包复现步骤
+
+归档交接包用于把已完成的批次整理成可交给外部人员核对的离线包。每个交接包包含：
+- `manifest.json` - JSON 格式的完整文件清单（含 SHA-256 哈希、源路径、归档路径）
+- `manifest.csv` - CSV 格式的文件清单（Excel 可直接打开，UTF-8-BOM）
+- `batch_report_*.txt` - 原始批次报告副本
+- `files/` - 归档照片副本（按原始归档层级组织）
+- `README.txt` - 交接说明文档（含目录结构、统计信息、核对方法、配置摘要）
+
+### 0. 准备环境
+
+```bash
+cd examples
+pip install -r ../requirements.txt
+```
+
+### 1. 先执行 run 完成归档
+
+```bash
+# 如果是首次，先 dry-run 预演
+python -m patrol_archiver dry-run -c config.yaml
+
+# 确认无误后实际执行归档
+python -m patrol_archiver run -c config.yaml
+```
+
+### 2. handover-create 生成交接包
+
+```bash
+# 使用最近一次 run 批次，输出到 handover_pkg 目录
+python -m patrol_archiver handover-create -c config.yaml -o handover_pkg
+
+# 或指定批次 ID
+python -m patrol_archiver handover-create -c config.yaml -b batch_20240101_001 -o handover_pkg
+
+# 若 handover_pkg 已存在，会自动改用 handover_pkg_1、handover_pkg_2...
+```
+
+生成的目录结构：
+
+```
+handover_pkg/
+├── manifest.json           # 完整清单：handover_id、批次信息、摘要、文件列表
+├── manifest.csv            # Excel 可直接打开的 CSV 清单
+├── batch_report_batch_*.txt  # 批次报告副本
+├── README.txt              # 交接说明（含核对方法）
+└── files/                  # 归档照片（按原归档层级复制）
+    └── ...
+```
+
+### 3. handover-list 列出历史交接包
+
+```bash
+# 列出最近 20 条（默认）
+python -m patrol_archiver handover-list -c config.yaml
+
+# 列出最近 50 条
+python -m patrol_archiver handover-list -c config.yaml -n 50
+```
+
+### 4. handover-show 查看交接包详情
+
+```bash
+# 查看最近一次交接包
+python -m patrol_archiver handover-show -c config.yaml
+
+# 查看指定交接包
+python -m patrol_archiver handover-show -c config.yaml -d handover_20240101_000001
+```
+
+### 5. handover-verify 校验交接包完整性
+
+```bash
+# 校验最近一次交接包
+python -m patrol_archiver handover-verify -c config.yaml
+
+# 校验指定交接包
+python -m patrol_archiver handover-verify -c config.yaml -d handover_20240101_000001
+
+# 若发现文件缺失或哈希不匹配，会以退出码 12 非 0 退出
+echo "Exit code: $?"
+```
+
+校验内容包括：
+- 交接包目录是否还存在
+- `manifest.json` 是否可解析
+- `files/` 下每个文件是否存在
+- 每个文件的 SHA-256 哈希是否与清单一致
+- 原始归档路径是否还存在
+- 原始源文件路径是否还存在
+
+### 6. 交给外部人员核对的方式
+
+把整个交接包目录（如 `handover_pkg/`）打包发给外部人员：
+
+```bash
+# 打包（Windows PowerShell）
+Compress-Archive -Path handover_pkg -DestinationPath handover_pkg.zip
+
+# 或 Linux / macOS
+tar -czvf handover_pkg.tar.gz handover_pkg/
+```
+
+外部人员收到后，可用以下方式核对（任选其一）：
+
+```bash
+# 方式一：使用本工具校验（推荐，前提是接收方也安装了 patrol_archiver）
+python -m patrol_archiver handover-verify -c config.yaml -d handover_20240101_000001
+
+# 方式二：手动用 sha256sum 核对（接收方只需标准工具）
+cd handover_pkg
+python -c "
+import json, hashlib, sys
+m = json.load(open('manifest.json', encoding='utf-8'))
+for f in m['files']:
+    h = hashlib.sha256()
+    with open(f['relative_path'], 'rb') as fh:
+        for chunk in iter(lambda: fh.read(1048576), b''):
+            h.update(chunk)
+    ok = h.hexdigest() == f['sha256']
+    print(f"{'OK' if ok else 'FAIL'} {f['relative_path']}")
+    if not ok: sys.exit(1)
+"
+
+# 方式三：用 manifest.csv 在 Excel 中人工核对
+# manifest.csv 含 idx/source/archive_path/relative_path/file_size/sha256/action/source_signature
+```
+
+
 ## CLI 命令总览
 
 | 命令 | 说明 |
@@ -343,6 +476,10 @@ python -m patrol_archiver dry-run -c from_template.yaml
 | `doctor -c CONFIG [--json\|--csv]` | 配置体检：检查 YAML 和巡检 CSV 是否可用（dry-run/run 前推荐执行） |
 | `doctor-history -c CONFIG [-n N]` | 列出体检历史记录（跨重启可查） |
 | `doctor-export -c CONFIG [-d DOCTOR_ID] [-o OUTPUT] [-f json\|csv\|auto] [--json\|--csv]` | 导出体检记录为 JSON 或 CSV |
+| `handover-create -c CONFIG [-b BATCH] -o DIR` | 生成归档交接包（manifest.json/csv + 报告副本 + README.txt），默认取最近批次，同名目录自动加序号 |
+| `handover-list -c CONFIG [-n N]` | 列出历史交接包（跨重启可查） |
+| `handover-show -c CONFIG [-d HANDOVER_ID]` | 查看交接包详情和包内文件列表 |
+| `handover-verify -c CONFIG [-d HANDOVER_ID]` | 校验交接包文件存在性、SHA-256 哈希和源/归档路径，异常非 0 退出 |
 
 ## 退出码
 
@@ -354,3 +491,5 @@ python -m patrol_archiver dry-run -c from_template.yaml
 | 3 | 检测到重复执行已完成批次 |
 | 4 | 回滚冲突或失败 |
 | 10 | doctor 体检发现 error 级别问题 |
+| 11 | 交接包生成错误（HandoverError） |
+| 12 | 交接包校验发现 error 级别问题 |

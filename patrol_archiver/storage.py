@@ -545,3 +545,154 @@ class DoctorStore:
         if not did:
             return None
         return self.get_doctor(did)
+
+
+@dataclass
+class HandoverFileEntry:
+    """交接包中的单个文件条目"""
+    idx: int
+    source: str
+    archive_path: str
+    relative_path: str
+    file_size: int
+    sha256: str
+    action: str = ""
+    source_signature: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "HandoverFileEntry":
+        return cls(
+            idx=data["idx"],
+            source=data["source"],
+            archive_path=data["archive_path"],
+            relative_path=data["relative_path"],
+            file_size=data.get("file_size", 0),
+            sha256=data["sha256"],
+            action=data.get("action", ""),
+            source_signature=data.get("source_signature", ""),
+        )
+
+
+@dataclass
+class HandoverRecord:
+    """交接包记录"""
+    handover_id: str
+    created_at: str
+    batch_id: str
+    output_dir: str
+    config_summary: Dict[str, Any]
+    files: List[HandoverFileEntry]
+    notes: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "handover_id": self.handover_id,
+            "created_at": self.created_at,
+            "batch_id": self.batch_id,
+            "output_dir": self.output_dir,
+            "config_summary": self.config_summary,
+            "files": [f.to_dict() for f in self.files],
+            "notes": self.notes,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "HandoverRecord":
+        return cls(
+            handover_id=data["handover_id"],
+            created_at=data["created_at"],
+            batch_id=data["batch_id"],
+            output_dir=data["output_dir"],
+            config_summary=data.get("config_summary", {}),
+            files=[HandoverFileEntry.from_dict(f) for f in data.get("files", [])],
+            notes=data.get("notes", ""),
+        )
+
+
+class HandoverError(Exception):
+    pass
+
+
+class HandoverStore:
+    """交接包记录持久化存储：保存在 state_dir/handovers 下"""
+
+    def __init__(self, state_dir: Path):
+        self.state_dir = Path(state_dir)
+        self.handovers_dir = self.state_dir / "handovers"
+        self.index_file = self.handovers_dir / "index.json"
+        self._ensure_dirs()
+
+    def _ensure_dirs(self) -> None:
+        self.handovers_dir.mkdir(parents=True, exist_ok=True)
+        if not self.index_file.exists():
+            self._write_index({"handovers": [], "last_handover_id": None})
+
+    def _read_index(self) -> Dict[str, Any]:
+        try:
+            raw = self.index_file.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (json.JSONDecodeError, FileNotFoundError, OSError):
+            data = {"handovers": [], "last_handover_id": None}
+            try:
+                self._write_index(data)
+            except Exception:
+                pass
+        data.setdefault("handovers", [])
+        data.setdefault("last_handover_id", None)
+        return data
+
+    def _write_index(self, data: Dict[str, Any]) -> None:
+        self.index_file.parent.mkdir(parents=True, exist_ok=True)
+        self.index_file.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+    def _handover_file(self, handover_id: str) -> Path:
+        safe_id = "".join(c if c.isalnum() or c in "-_." else "_" for c in handover_id)
+        return self.handovers_dir / f"{safe_id}.json"
+
+    def save_handover(self, record: HandoverRecord) -> HandoverRecord:
+        """保存交接包记录"""
+        f = self._handover_file(record.handover_id)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(
+            json.dumps(record.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        idx = self._read_index()
+        if record.handover_id not in idx["handovers"]:
+            idx["handovers"].insert(0, record.handover_id)
+        idx["last_handover_id"] = record.handover_id
+        self._write_index(idx)
+        return record
+
+    def get_handover(self, handover_id: str) -> Optional[HandoverRecord]:
+        """读取指定交接包记录"""
+        f = self._handover_file(handover_id)
+        if not f.exists():
+            return None
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            return HandoverRecord.from_dict(data)
+        except (json.JSONDecodeError, OSError, KeyError, TypeError):
+            return None
+
+    def list_handovers(self) -> List[str]:
+        """按时间倒序列出所有交接包 ID"""
+        idx = self._read_index()
+        return list(idx.get("handovers", []))
+
+    def get_last_handover_id(self) -> Optional[str]:
+        """获取最近一次交接包 ID"""
+        idx = self._read_index()
+        return idx.get("last_handover_id")
+
+    def get_last_handover(self) -> Optional[HandoverRecord]:
+        """获取最近一次交接包记录"""
+        hid = self.get_last_handover_id()
+        if not hid:
+            return None
+        return self.get_handover(hid)
