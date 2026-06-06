@@ -113,13 +113,19 @@ def _compare_config(
     batch: Batch,
     current_source_dir: Path,
     current_archive_dir: Path,
+    current_action: str = "",
+    current_target_pattern: str = "",
+    current_csv_path: str = "",
 ) -> Tuple[bool, Dict[str, Dict[str, str]]]:
-    """比对批次执行时的配置路径与当前配置路径"""
+    """比对批次执行时的配置与当前配置（路径、action、target_pattern、csv_path）"""
     diff: Dict[str, Dict[str, str]] = {}
     changed = False
 
     batch_source = batch.config_summary.get("source_dir", "")
     batch_archive = batch.config_summary.get("archive_dir", "")
+    batch_action = batch.config_summary.get("action", "")
+    batch_pattern = batch.config_summary.get("target_pattern", "")
+    batch_csv = batch.config_summary.get("csv_path", "")
 
     current_source_str = str(current_source_dir.resolve())
     current_archive_str = str(current_archive_dir.resolve())
@@ -131,6 +137,18 @@ def _compare_config(
     if batch_archive and batch_archive != current_archive_str:
         changed = True
         diff["archive_dir"] = {"batch": batch_archive, "current": current_archive_str}
+
+    if batch_action and current_action and batch_action != current_action:
+        changed = True
+        diff["action"] = {"batch": batch_action, "current": current_action}
+
+    if batch_pattern and current_target_pattern and batch_pattern != current_target_pattern:
+        changed = True
+        diff["target_pattern"] = {"batch": batch_pattern, "current": current_target_pattern}
+
+    if batch_csv and current_csv_path and batch_csv != current_csv_path:
+        changed = True
+        diff["csv_path"] = {"batch": batch_csv, "current": current_csv_path}
 
     return changed, diff
 
@@ -146,12 +164,22 @@ class Auditor:
         batch: Batch,
         current_source_dir: Path,
         current_archive_dir: Path,
+        current_action: str = "",
+        current_target_pattern: str = "",
+        current_csv_path: str = "",
     ) -> AuditResult:
         """执行对账审计，返回 AuditResult"""
         audit_id = f"audit_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
-        # 1) 配置路径比对
-        cfg_changed, cfg_diff = _compare_config(batch, current_source_dir, current_archive_dir)
+        # 1) 配置路径比对（含 action、target_pattern、csv_path）
+        cfg_changed, cfg_diff = _compare_config(
+            batch,
+            current_source_dir,
+            current_archive_dir,
+            current_action=current_action,
+            current_target_pattern=current_target_pattern,
+            current_csv_path=current_csv_path,
+        )
 
         # 2) 扫描归档目录中所有实际存在的文件
         archive_files = _scan_archive_files(current_archive_dir)

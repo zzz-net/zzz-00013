@@ -58,6 +58,7 @@ from .rollback import (
     detect_format,
     export_audit_report,
     export_report,
+    format_audit_history,
     format_audit_summary,
     format_batch_list,
     format_batch_summary,
@@ -209,6 +210,21 @@ def run_cmd(config_path: str) -> None:
     click.echo(f"执行完成，批次 ID: {batch.batch_id}")
     click.echo(f"报告路径: {batch.report_path}")
     click.echo(f"状态目录: {cfg.state_dir}")
+
+    try:
+        auditor = Auditor(store)
+        audit_result = auditor.audit(
+            batch,
+            cfg.source_dir,
+            cfg.archive_dir,
+            current_action=cfg.action,
+            current_target_pattern=cfg.target_pattern,
+            current_csv_path=str(cfg.csv_path),
+        )
+        store.save_audit(audit_result)
+        click.echo(f"初始审计快照已保存: {audit_result.audit_id}")
+    except Exception as e:
+        click.echo(f"警告: 初始审计快照保存失败 - {e}", err=True)
 
 
 @main.command("rollback")
@@ -364,6 +380,8 @@ def export_cmd(config_path: str, batch_id: str, output_path: str, fmt: str) -> N
 )
 def audit_cmd(config_path: str, batch_id: str, json_out: bool, csv_out: bool, output_path: str, fmt: str) -> None:
     """按批次对账审计：逐项比对状态记录与当前源目录、归档目录"""
+    pure_output = json_out or csv_out
+
     try:
         cfg = _load_and_validate(config_path)
     except click.ClickException as e:
@@ -377,19 +395,27 @@ def audit_cmd(config_path: str, batch_id: str, json_out: bool, csv_out: bool, ou
         if not batch_id:
             click.echo("错误: 未找到任何批次记录", err=True)
             sys.exit(1)
-        click.echo(f"使用最近一次批次: {batch_id}")
+        if not pure_output:
+            click.echo(f"使用最近一次批次: {batch_id}")
 
     batch = store.get_batch(batch_id)
     if batch is None:
         click.echo(f"错误: 批次不存在: {batch_id}", err=True)
         sys.exit(1)
 
-    if batch.dry_run:
+    if batch.dry_run and not pure_output:
         click.echo("提示: DRY-RUN 批次未执行实际文件操作，审计仅校验配置一致性。", err=True)
 
     auditor = Auditor(store)
     try:
-        result = auditor.audit(batch, cfg.source_dir, cfg.archive_dir)
+        result = auditor.audit(
+            batch,
+            cfg.source_dir,
+            cfg.archive_dir,
+            current_action=cfg.action,
+            current_target_pattern=cfg.target_pattern,
+            current_csv_path=str(cfg.csv_path),
+        )
     except Exception as e:
         click.echo(f"错误: 执行审计失败 - {e}", err=True)
         sys.exit(1)
@@ -463,6 +489,42 @@ def audit_cmd(config_path: str, batch_id: str, json_out: bool, csv_out: bool, ou
 
     if has_errors:
         sys.exit(5)
+
+
+@main.command("audit-list")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
+@click.option("-b", "--batch", "batch_id", default=None, help="批次 ID，不指定则使用最近一次")
+@click.option("-n", "--limit", type=int, default=20, help="显示最近 N 条审计记录")
+def audit_list_cmd(config_path: str, batch_id: str, limit: int) -> None:
+    """列出指定批次的审计历史（按时间倒序）"""
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        click.echo(f"错误: 加载配置失败 - {e}", err=True)
+        sys.exit(1)
+
+    store = StateStore(cfg.state_dir)
+
+    if not batch_id:
+        batch_id = store.get_last_batch_id()
+        if not batch_id:
+            click.echo("错误: 未找到任何批次记录", err=True)
+            sys.exit(1)
+        click.echo(f"使用最近一次批次: {batch_id}")
+
+    batch = store.get_batch(batch_id)
+    if batch is None:
+        click.echo(f"错误: 批次不存在: {batch_id}", err=True)
+        sys.exit(1)
+
+    audit_ids = store.list_audits_for_batch(batch_id)[:limit]
+    audits = [a for a in (store.get_audit(aid) for aid in audit_ids) if a is not None]
+
+    click.echo(f"批次 ID: {batch_id}")
+    click.echo(f"状态目录: {cfg.state_dir}")
+    click.echo(f"共 {len(audit_ids)} 次审计（显示最近 {len(audits)} 个）:")
+    click.echo("")
+    click.echo(format_audit_history(audits))
 
 
 if __name__ == "__main__":

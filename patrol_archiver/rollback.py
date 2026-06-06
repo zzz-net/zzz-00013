@@ -550,7 +550,7 @@ def format_audit_summary(audit: Any) -> str:
 
     if audit.config_path_changed:
         lines.append("")
-        lines.append("!!! 配置路径已变更（对账结果可能不准确） !!!")
+        lines.append("!!! 配置已变更（对账结果可能不准确） !!!")
         for key, pair in audit.config_diff.items():
             lines.append(f"  {key}: 批次='{pair.get('batch')}' 当前='{pair.get('current')}'")
 
@@ -574,4 +574,29 @@ def format_audit_summary(audit: Any) -> str:
             tag = {"warning": "[WARN]", "error": "[ERR]", "risk": "[RISK]"}.get(w.level, "[?]")
             lines.append(f"  {tag} [{w.code}] {w.message}")
 
+    return "\n".join(lines)
+
+
+def format_audit_history(audits: List[Any]) -> str:
+    """格式化审计历史列表用于终端输出"""
+    if not audits:
+        return "(无审计记录)"
+    lines = []
+    for a in audits:
+        counts = a.counts or {}
+        total_issues = (
+            counts.get("missing_in_archive", 0)
+            + counts.get("missing_in_source", 0)
+            + counts.get("overwritten", 0)
+            + counts.get("tampered", 0)
+            + counts.get("rollback_risk", 0)
+        )
+        warnings_total = len(a.warnings) if a.warnings else 0
+        cfg_tag = "[CFG-CHG]" if a.config_path_changed else "         "
+        health = "[HEALTHY]" if total_issues == 0 and warnings_total == 0 else "[ISSUES]"
+        lines.append(
+            f"{a.audit_id}  {a.created_at}  {cfg_tag}  {health}  "
+            f"OK={counts.get('success', 0)}  ISSUES={total_issues}  "
+            f"WARN={warnings_total}  EXTRA={len(a.extra_archive_files) if a.extra_archive_files else 0}"
+        )
     return "\n".join(lines)

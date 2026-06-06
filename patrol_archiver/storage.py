@@ -116,19 +116,39 @@ class StateStore:
         self.batches_dir.mkdir(parents=True, exist_ok=True)
         self.audits_dir.mkdir(parents=True, exist_ok=True)
         if not self.index_file.exists():
-            self.index_file.write_text(
-                json.dumps(
-                    {"batches": [], "last_batch_id": None, "audits": {}, "last_audit_id": None},
-                    ensure_ascii=False,
-                    indent=2
-                ),
-                encoding="utf-8"
+            self._write_index(
+                {"batches": [], "last_batch_id": None, "audits": {}, "last_audit_id": None}
             )
 
     def _read_index(self) -> Dict[str, Any]:
-        return json.loads(self.index_file.read_text(encoding="utf-8"))
+        try:
+            raw = self.index_file.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (json.JSONDecodeError, FileNotFoundError, OSError) as e:
+            backup = None
+            if self.index_file.exists():
+                try:
+                    backup = self.index_file.read_bytes()
+                except Exception:
+                    pass
+            data = {"batches": [], "last_batch_id": None, "audits": {}, "last_audit_id": None}
+            try:
+                self._write_index(data)
+            except Exception:
+                pass
+            if backup:
+                try:
+                    (self.state_dir / "index.corrupted.bak").write_bytes(backup)
+                except Exception:
+                    pass
+        data.setdefault("batches", [])
+        data.setdefault("audits", {})
+        data.setdefault("last_batch_id", None)
+        data.setdefault("last_audit_id", None)
+        return data
 
     def _write_index(self, data: Dict[str, Any]) -> None:
+        self.index_file.parent.mkdir(parents=True, exist_ok=True)
         self.index_file.write_text(
             json.dumps(data, ensure_ascii=False, indent=2),
             encoding="utf-8"
@@ -154,7 +174,9 @@ class StateStore:
         return batch
 
     def save_batch(self, batch: Batch) -> None:
-        self._batch_file(batch.batch_id).write_text(
+        f = self._batch_file(batch.batch_id)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(
             json.dumps(batch.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
@@ -163,8 +185,11 @@ class StateStore:
         f = self._batch_file(batch_id)
         if not f.exists():
             return None
-        data = json.loads(f.read_text(encoding="utf-8"))
-        return Batch.from_dict(data)
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            return Batch.from_dict(data)
+        except (json.JSONDecodeError, OSError, KeyError, TypeError):
+            return None
 
     def list_batches(self) -> List[str]:
         idx = self._read_index()
@@ -204,7 +229,9 @@ class StateStore:
 
     def save_audit(self, audit_result: Any) -> None:
         """保存审计结果到持久化存储"""
-        self._audit_file(audit_result.audit_id).write_text(
+        f = self._audit_file(audit_result.audit_id)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(
             json.dumps(audit_result.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
@@ -222,8 +249,11 @@ class StateStore:
         f = self._audit_file(audit_id)
         if not f.exists():
             return None
-        data = json.loads(f.read_text(encoding="utf-8"))
-        return AuditResult.from_dict(data)
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            return AuditResult.from_dict(data)
+        except (json.JSONDecodeError, OSError, KeyError, TypeError):
+            return None
 
     def list_audits_for_batch(self, batch_id: str) -> List[str]:
         """列出指定批次的所有审计 ID（从新到旧）"""

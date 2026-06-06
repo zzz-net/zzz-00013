@@ -487,6 +487,235 @@ def test_audit_same_size_different_content() -> None:
                 "CSV 缺少审计 section")
 
 
+def test_run_saves_initial_audit_snapshot() -> None:
+    """run 命令执行完成后应自动保存初始审计快照，跨进程可读取。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+        _assert("初始审计快照已保存:" in r.stdout,
+                f"run 未输出初始审计快照信息: {r.stdout}")
+
+        r2 = _run_cli(ws, "show", "-c", "config.yaml")
+        _assert(r2.returncode == 0, f"show after run failed: {r2.stderr}")
+        _assert("=== 最近审计摘要 ===" in r2.stdout,
+                f"run 后 show 未显示自动保存的审计摘要: {r2.stdout}")
+
+        r3 = _run_cli(ws, "audit-list", "-c", "config.yaml")
+        _assert(r3.returncode == 0, f"audit-list failed: {r3.stderr}")
+        _assert("HEALTHY" in r3.stdout or "ISSUES" in r3.stdout,
+                f"audit-list 未显示健康状态标签: {r3.stdout}")
+
+
+def test_audit_list_command_and_multiple_audits() -> None:
+    """audit-list 命令应按时间倒序列出同一批次的多次审计。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        for i in range(3):
+            r = _run_cli(ws, "audit", "-c", "config.yaml")
+            _assert(r.returncode == 0, f"audit #{i+1} failed: {r.stderr}")
+
+        r = _run_cli(ws, "audit-list", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"audit-list failed: {r.stderr}")
+        lines = [l for l in r.stdout.splitlines() if l.strip().startswith("audit_")]
+        _assert(len(lines) >= 4,
+                f"audit-list 应至少列出 4 次审计（1次初始+3次手动），实际 {len(lines)} 行:\n{r.stdout}")
+
+        r2 = _run_cli(ws, "audit-list", "-c", "config.yaml", "-n", "2")
+        lines2 = [l for l in r2.stdout.splitlines() if l.strip().startswith("audit_")]
+        _assert(len(lines2) == 2, f"audit-list -n 2 应只显示 2 条，实际 {len(lines2)}: {r2.stdout}")
+
+
+def test_audit_config_change_action_and_pattern() -> None:
+    """配置 action 或 target_pattern 变更时，audit 应标注差异并生成 warning。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        cfg_path = ws / "config.yaml"
+        cfg_text = cfg_path.read_text(encoding="utf-8")
+
+        alt_text = cfg_text.replace('action: "copy"', 'action: "move"')
+        alt_text = alt_text.replace(
+            'target_pattern: "{device_id}/{point}/{date}/{filename}"',
+            'target_pattern: "{date}/{device_id}_{filename}"'
+        )
+        cfg_path.write_text(alt_text, encoding="utf-8")
+
+        r = _run_cli(ws, "audit", "-c", "config.yaml", "--json")
+        _assert(r.returncode == 0, f"audit --json with changed config failed: {r.stderr}")
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            _assert(False, f"--json 输出不纯，无法解析: {e}\nstdout={r.stdout}")
+
+        _assert(data.get("config_path_changed") is True,
+                f"config_path_changed 应为 True，实际: {data.get('config_path_changed')}")
+        diff = data.get("config_diff", {})
+        _assert("action" in diff, f"config_diff 应包含 action，实际 keys: {list(diff.keys())}")
+        _assert("target_pattern" in diff,
+                f"config_diff 应包含 target_pattern，实际 keys: {list(diff.keys())}")
+        _assert(diff["action"]["batch"] == "copy" and diff["action"]["current"] == "move",
+                f"action 差异不正确: {diff.get('action')}")
+
+        warnings = data.get("warnings", [])
+        codes = [w.get("code") for w in warnings]
+        _assert(any("action" in c for c in codes),
+                f"warnings 中应包含 action 变更警告，实际 codes: {codes}")
+
+
+def test_audit_pure_json_csv_output() -> None:
+    """--json / --csv 输出应纯净，不包含 '使用最近一次批次' 等提示文本。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        r = _run_cli(ws, "audit", "-c", "config.yaml", "--json")
+        _assert(r.returncode == 0, f"audit --json failed: {r.stderr}")
+        _assert("使用最近一次批次" not in r.stdout,
+                f"--json 输出不应包含中文提示文本: {r.stdout[:200]}")
+        try:
+            json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            _assert(False, f"--json 输出不是合法 JSON: {e}\n{r.stdout}")
+
+        r = _run_cli(ws, "audit", "-c", "config.yaml", "--csv")
+        _assert(r.returncode == 0, f"audit --csv failed: {r.stderr}")
+        _assert("使用最近一次批次" not in r.stdout,
+                f"--csv 输出不应包含中文提示文本: {r.stdout[:200]}")
+        rows = list(csv.reader(io.StringIO(r.stdout)))
+        _assert(len(rows) >= 3, f"--csv 输出行数太少: {len(rows)}")
+        _assert("audit_summary" in rows[1][0] or "audit_summary" in r.stdout,
+                f"--csv 输出应包含 audit_summary section")
+
+
+def test_audit_export_parent_dir_creation() -> None:
+    """导出时父目录不存在应自动创建。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        deep_json = ws / "a" / "b" / "c" / "deep_audit.json"
+        _assert(not deep_json.parent.exists(), "测试前置条件：父目录应不存在")
+        r = _run_cli(ws, "audit", "-c", "config.yaml", "-o", str(deep_json))
+        _assert(r.returncode == 0, f"导出到深层目录失败: {r.stderr}")
+        _assert(deep_json.exists() and deep_json.stat().st_size > 0,
+                "JSON 导出到不存在的父目录时应自动创建父目录并生成文件")
+
+        deep_csv = ws / "x" / "y" / "z" / "deep_audit.csv"
+        r = _run_cli(ws, "audit", "-c", "config.yaml", "-o", str(deep_csv))
+        _assert(r.returncode == 0, f"导出 CSV 到深层目录失败: {r.stderr}")
+        _assert(deep_csv.exists() and deep_csv.stat().st_size > 0,
+                "CSV 导出到不存在的父目录时应自动创建父目录并生成文件")
+
+
+def test_audit_after_rollback() -> None:
+    """回滚后的批次再次审计应标记为回滚状态，不应报错崩溃。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        r = _run_cli(ws, "rollback", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"rollback failed: {r.stderr}")
+        _assert("回滚完成" in r.stdout, f"rollback 输出异常: {r.stdout}")
+
+        r = _run_cli(ws, "audit", "-c", "config.yaml")
+        _assert(r.returncode == 0,
+                f"回滚后 audit 应 exit=0 或正常，实际 exit={r.returncode}\nstdout={r.stdout}\nstderr={r.stderr}")
+        _assert("批次审计报告" in r.stdout or "对账统计" in r.stdout,
+                f"回滚后 audit 未输出报告: {r.stdout}")
+
+        json_out = ws / "audit_after_rollback.json"
+        r = _run_cli(ws, "audit", "-c", "config.yaml", "-o", str(json_out))
+        _assert(r.returncode == 0, f"回滚后 audit 导出 JSON 失败: {r.stderr}")
+        _assert(json_out.exists() and json_out.stat().st_size > 0,
+                "回滚后 audit 应能导出 JSON 报告")
+        data = json.loads(json_out.read_text(encoding="utf-8"))
+        _assert("counts" in data and "file_records" in data,
+                "回滚后导出的 JSON 缺少关键字段")
+
+
+def test_audit_export_csv_contains_config_diff_section() -> None:
+    """审计 CSV 导出应包含 audit_config_diff section 且字段名稳定。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        cfg_path = ws / "config.yaml"
+        cfg_text = cfg_path.read_text(encoding="utf-8")
+        alt_text = cfg_text.replace('action: "copy"', 'action: "move"')
+        cfg_path.write_text(alt_text, encoding="utf-8")
+
+        csv_out = ws / "audit_diff.csv"
+        r = _run_cli(ws, "audit", "-c", "config.yaml", "-o", str(csv_out))
+        _assert(r.returncode == 0, f"audit 导出 CSV 失败: {r.stderr}")
+        _assert(csv_out.exists(), "CSV 文件未生成")
+
+        text = csv_out.read_text(encoding="utf-8-sig")
+        rows = list(csv.reader(io.StringIO(text)))
+        sections = set()
+        for row in rows:
+            if row:
+                sections.add(row[0].strip())
+
+        for required in ("audit_summary", "audit_file", "audit_warning",
+                         "audit_extra", "audit_config_diff"):
+            _assert(required in sections,
+                    f"审计 CSV 缺少 section={required}，实际 sections={sections}")
+
+        config_diff_header = None
+        for i, row in enumerate(rows):
+            if row and row[0] == "section" and "config_key" in row:
+                config_diff_header = row
+                break
+        _assert(config_diff_header is not None, "未找到 audit_config_diff 表头行")
+        for stable in ("section", "audit_id", "batch_id", "idx",
+                       "config_key", "batch_value", "current_value"):
+            _assert(stable in config_diff_header,
+                    f"audit_config_diff 表头缺少稳定字段 {stable}: {config_diff_header}")
+
+
+def test_multiple_audit_snapshots_track_health_change() -> None:
+    """多次审计快照应能追踪批次健康状态变化。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        r = _run_cli(ws, "audit", "-c", "config.yaml", "-o", str(ws / "audit1.json"))
+        _assert(r.returncode == 0, f"audit #1 failed: {r.stderr}")
+        a1 = json.loads((ws / "audit1.json").read_text(encoding="utf-8"))
+        initial_health = a1["counts"].get("success", 0)
+        _assert(initial_health >= 1, "首次审计应有 success 文件")
+
+        archive = ws / "archive"
+        archived = []
+        for root, _, files in os.walk(archive):
+            for f in files:
+                archived.append(Path(root) / f)
+        _assert(len(archived) >= 1, f"归档目录为空: {archived}")
+        archived[0].unlink()
+
+        r = _run_cli(ws, "audit", "-c", "config.yaml", "-o", str(ws / "audit2.json"))
+        a2 = json.loads((ws / "audit2.json").read_text(encoding="utf-8"))
+        _assert(a2["counts"].get("missing_in_archive", 0) >= 1,
+                f"删除归档后应检测到 missing_in_archive，counts={a2['counts']}")
+        _assert(a2["counts"].get("success", 0) < initial_health,
+                f"删除归档后 success 应减少，before={initial_health}, after={a2['counts']}")
+
+        r = _run_cli(ws, "audit-list", "-c", "config.yaml")
+        _assert("HEALTHY" in r.stdout, f"audit-list 未显示 HEALTHY 标签: {r.stdout}")
+        _assert("ISSUES" in r.stdout, f"audit-list 未显示 ISSUES 标签: {r.stdout}")
+
+
 def main() -> int:
     tests = [
         ("跨进程持久化: list/show/export", test_cross_process_persistence),
@@ -499,6 +728,14 @@ def main() -> int:
         ("审计: 检测删除/覆盖/回滚风险", test_audit_detect_deletion_and_overwrite),
         ("审计: 不存在批次与配置路径变更", test_audit_nonexistent_batch_and_config_change),
         ("审计: 同字节数异内容签名验签", test_audit_same_size_different_content),
+        ("审计新特性: run 自动保存初始审计快照", test_run_saves_initial_audit_snapshot),
+        ("审计新特性: audit-list 命令 + 多次审计历史", test_audit_list_command_and_multiple_audits),
+        ("审计新特性: action/target_pattern 变更检测", test_audit_config_change_action_and_pattern),
+        ("审计新特性: --json/--csv 纯输出无提示文本", test_audit_pure_json_csv_output),
+        ("审计新特性: 导出父目录不存在时自动创建", test_audit_export_parent_dir_creation),
+        ("审计新特性: 回滚后再审计", test_audit_after_rollback),
+        ("审计新特性: CSV 导出含 config_diff 稳定字段", test_audit_export_csv_contains_config_diff_section),
+        ("审计新特性: 多次快照追踪健康变化", test_multiple_audit_snapshots_track_health_change),
     ]
     failed = 0
     for name, fn in tests:
