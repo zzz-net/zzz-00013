@@ -1,5 +1,7 @@
 """回滚与报告导出"""
+import csv
 import hashlib
+import io
 import json
 import shutil
 from datetime import datetime
@@ -109,14 +111,205 @@ def _rollback_one(rec: FileActionRecord) -> None:
         raise RollbackError(f"未知动作类型: {rec.action}")
 
 
-def export_report(batch: Batch, output_path: Path) -> Path:
+SUMMARY_FIELDS = [
+    "batch_id",
+    "created_at",
+    "status",
+    "mode",
+    "action",
+    "source_dir",
+    "archive_dir",
+    "csv_path",
+    "target_pattern",
+    "actions_total",
+    "actions_success",
+    "actions_failed",
+    "actions_pending",
+    "actions_rolled_back",
+    "missing_count",
+    "extra_files_count",
+    "duplicate_targets_count",
+    "path_conflicts_count",
+    "report_path",
+    "error",
+]
+
+ACTION_FIELDS = [
+    "section",
+    "batch_id",
+    "idx",
+    "status",
+    "action",
+    "source",
+    "target",
+    "error",
+]
+
+ISSUE_FIELDS = [
+    "section",
+    "batch_id",
+    "idx",
+    "line_no",
+    "device_id",
+    "point",
+    "date",
+    "photo_name",
+    "source",
+    "target",
+    "reason",
+]
+
+
+def _build_summary_row(batch: Batch) -> dict:
+    actions_total = len(batch.actions)
+    actions_success = sum(1 for a in batch.actions if a.status == "success")
+    actions_failed = sum(1 for a in batch.actions if a.status == "failed")
+    actions_pending = sum(1 for a in batch.actions if a.status == "pending")
+    actions_rolled_back = sum(1 for a in batch.actions if a.status == "rolled_back")
+    ps = batch.plan_summary
+    return {
+        "batch_id": batch.batch_id,
+        "created_at": batch.created_at,
+        "status": batch.status,
+        "mode": "DRY-RUN" if batch.dry_run else "RUN",
+        "action": batch.config_summary.get("action", ""),
+        "source_dir": batch.config_summary.get("source_dir", ""),
+        "archive_dir": batch.config_summary.get("archive_dir", ""),
+        "csv_path": batch.config_summary.get("csv_path", ""),
+        "target_pattern": batch.config_summary.get("target_pattern", ""),
+        "actions_total": actions_total,
+        "actions_success": actions_success,
+        "actions_failed": actions_failed,
+        "actions_pending": actions_pending,
+        "actions_rolled_back": actions_rolled_back,
+        "missing_count": len(ps.missing),
+        "extra_files_count": len(ps.extra_files),
+        "duplicate_targets_count": len(ps.duplicate_targets),
+        "path_conflicts_count": len(ps.path_conflicts),
+        "report_path": batch.report_path or "",
+        "error": batch.error or "",
+    }
+
+
+def export_csv_report(batch: Batch, output_path: Path) -> Path:
+    """导出 CSV 报告，包含批次摘要、文件动作、缺图、清单外文件、重复目标名、路径冲突。
+    使用 section 字段区分不同数据段，字段名稳定，Excel/Numbers 可直接打开。"""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(
-        json.dumps(batch.to_dict(), ensure_ascii=False, indent=2),
-        encoding="utf-8"
-    )
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+
+    summary_row = _build_summary_row(batch)
+    writer.writerow(["section"] + SUMMARY_FIELDS)
+    writer.writerow(["summary"] + [summary_row.get(k, "") for k in SUMMARY_FIELDS])
+    writer.writerow([])
+
+    writer.writerow(ACTION_FIELDS)
+    for idx, a in enumerate(batch.actions, start=1):
+        writer.writerow([
+            "action",
+            batch.batch_id,
+            idx,
+            a.status,
+            a.action,
+            a.source,
+            a.target,
+            a.error or "",
+        ])
+
+    ps = batch.plan_summary
+    writer.writerow([])
+    writer.writerow(ISSUE_FIELDS)
+
+    for idx, m in enumerate(ps.missing, start=1):
+        writer.writerow([
+            "missing",
+            batch.batch_id,
+            idx,
+            m.get("line_no", ""),
+            m.get("device_id", ""),
+            m.get("point", ""),
+            m.get("date", ""),
+            m.get("photo_name", ""),
+            "",
+            "",
+            "",
+        ])
+
+    for idx, ef in enumerate(ps.extra_files, start=1):
+        writer.writerow([
+            "extra_file",
+            batch.batch_id,
+            idx,
+            "",
+            "",
+            "",
+            "",
+            "",
+            ef,
+            "",
+            "",
+        ])
+
+    idx = 0
+    for tgt, items in ps.duplicate_targets.items():
+        for item in items:
+            idx += 1
+            writer.writerow([
+                "duplicate_target",
+                batch.batch_id,
+                idx,
+                item.get("line_no", ""),
+                item.get("device_id", ""),
+                item.get("point", ""),
+                item.get("date", ""),
+                item.get("photo_name", ""),
+                item.get("source", ""),
+                tgt,
+                "",
+            ])
+
+    for idx, pc in enumerate(ps.path_conflicts, start=1):
+        writer.writerow([
+            "path_conflict",
+            batch.batch_id,
+            idx,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            pc.get("target", ""),
+            pc.get("reason", ""),
+        ])
+
+    output_path.write_text(buf.getvalue(), encoding="utf-8-sig")
     return output_path
+
+
+def detect_format(output_path: Path) -> str:
+    suffix = Path(output_path).suffix.lower()
+    if suffix == ".csv":
+        return "csv"
+    return "json"
+
+
+def export_report(batch: Batch, output_path: Path, fmt: Optional[str] = None) -> Path:
+    """导出批次报告。fmt 为 None 时按扩展名自动识别 (json/csv)。"""
+    fmt = (fmt or detect_format(output_path)).lower()
+    if fmt == "csv":
+        return export_csv_report(batch, output_path)
+    if fmt == "json":
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(batch.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        return output_path
+    raise ValueError(f"不支持的导出格式: {fmt}，请使用 json 或 csv")
 
 
 def format_batch_summary(batch: Batch) -> str:

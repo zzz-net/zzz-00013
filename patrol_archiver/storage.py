@@ -18,6 +18,28 @@ class FileActionRecord:
 
 
 @dataclass
+class PlanSummary:
+    missing: List[Dict[str, Any]] = field(default_factory=list)
+    extra_files: List[str] = field(default_factory=list)
+    duplicate_targets: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
+    path_conflicts: List[Dict[str, str]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "PlanSummary":
+        if not data:
+            return cls()
+        return cls(
+            missing=list(data.get("missing", [])),
+            extra_files=list(data.get("extra_files", [])),
+            duplicate_targets=dict(data.get("duplicate_targets", {})),
+            path_conflicts=list(data.get("path_conflicts", [])),
+        )
+
+
+@dataclass
 class Batch:
     batch_id: str
     created_at: str
@@ -27,6 +49,7 @@ class Batch:
     report_path: Optional[str] = None
     error: Optional[str] = None
     dry_run: bool = False
+    plan_summary: PlanSummary = field(default_factory=PlanSummary)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -38,6 +61,7 @@ class Batch:
             "report_path": self.report_path,
             "error": self.error,
             "dry_run": self.dry_run,
+            "plan_summary": self.plan_summary.to_dict(),
         }
 
     @classmethod
@@ -51,6 +75,7 @@ class Batch:
             report_path=data.get("report_path"),
             error=data.get("error"),
             dry_run=data.get("dry_run", False),
+            plan_summary=PlanSummary.from_dict(data.get("plan_summary")),
         )
 
 

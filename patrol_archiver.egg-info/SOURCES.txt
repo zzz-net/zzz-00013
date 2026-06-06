@@ -15,3 +15,4 @@ patrol_archiver.egg-info/dependency_links.txt
 patrol_archiver.egg-info/entry_points.txt
 patrol_archiver.egg-info/requires.txt
 patrol_archiver.egg-info/top_level.txt
+tests/test_regression.py

@@ -1,16 +1,61 @@
 """CLI 入口"""
+import io
+import os
 import sys
 from pathlib import Path
 
 import click
 
 from . import __version__
+
+
+def _configure_console_encoding() -> None:
+    """确保 stdout/stderr 对 Unicode 安全：优先 UTF-8，失败时用 replace 兜底。
+
+    Windows GBK/CP936 控制台输出非 ASCII 字符时默认会抛 UnicodeEncodeError。
+    这里不吞异常，而是在流层用 errors='replace' 保证程序不崩；UTF-8 终端无影响。
+    """
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name)
+        if not isinstance(stream, io.TextIOBase):
+            continue
+        target_enc = "utf-8"
+        try:
+            stream.reconfigure(encoding=target_enc, errors="replace")
+        except Exception:
+            try:
+                buffer = getattr(stream, "buffer", None)
+                if buffer is None:
+                    continue
+                new_stream = io.TextIOWrapper(
+                    buffer,
+                    encoding=target_enc,
+                    errors="replace",
+                    line_buffering=getattr(stream, "line_buffering", True),
+                )
+                setattr(sys, stream_name, new_stream)
+            except Exception:
+                pass
+
+
+_configure_console_encoding()
+
+
+STATUS_MARKS = {
+    "success": "[OK]",
+    "failed": "[FAIL]",
+    "pending": "[PEND]",
+    "rolled_back": "[RB]",
+}
+
+
 from .config import ArchiverConfig, load_config
 from .csv_parser import parse_patrol_csv
 from .executor import Executor, ExecutorError
 from .planner import generate_plan
 from .rollback import (
     RollbackError,
+    detect_format,
     export_report,
     format_batch_list,
     format_batch_summary,
@@ -246,7 +291,7 @@ def show_cmd(config_path: str, batch_id: str) -> None:
         click.echo("")
         click.echo("=== 文件动作日志 ===")
         for a in batch.actions:
-            mark = {"success": "✓", "failed": "✗", "pending": "○", "rolled_back": "↺"}.get(a.status, "?")
+            mark = STATUS_MARKS.get(a.status, "[?]")
             click.echo(f"  {mark} [{a.status:10s}] {a.action.upper():4s}  {a.source}")
             click.echo(f"           -> {a.target}")
             if a.error:
@@ -256,9 +301,15 @@ def show_cmd(config_path: str, batch_id: str) -> None:
 @main.command("export")
 @click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
 @click.option("-b", "--batch", "batch_id", default=None, help="批次 ID，不指定则使用最近一次")
-@click.option("-o", "--output", "output_path", required=True, help="导出文件路径 (JSON)")
-def export_cmd(config_path: str, batch_id: str, output_path: str) -> None:
-    """导出批次报告为 JSON"""
+@click.option("-o", "--output", "output_path", required=True, help="导出文件路径 (.json 或 .csv)")
+@click.option(
+    "-f", "--format", "fmt",
+    type=click.Choice(["json", "csv", "auto"], case_sensitive=False),
+    default="auto",
+    help="导出格式：json / csv / auto（按扩展名自动识别，默认 auto）"
+)
+def export_cmd(config_path: str, batch_id: str, output_path: str, fmt: str) -> None:
+    """导出批次报告（JSON 或 CSV）"""
     try:
         cfg = load_config(config_path)
     except Exception as e:
@@ -278,13 +329,16 @@ def export_cmd(config_path: str, batch_id: str, output_path: str) -> None:
         click.echo(f"错误: 批次不存在: {batch_id}", err=True)
         sys.exit(1)
 
+    resolved_fmt = None if fmt.lower() == "auto" else fmt.lower()
+    actual_fmt = resolved_fmt or detect_format(Path(output_path))
+
     try:
-        out = export_report(batch, Path(output_path))
+        out = export_report(batch, Path(output_path), fmt=resolved_fmt)
     except Exception as e:
         click.echo(f"错误: 导出失败 - {e}", err=True)
         sys.exit(1)
 
-    click.echo(f"已导出到: {out}")
+    click.echo(f"已导出 [{actual_fmt.upper()}] 到: {out}")
 
 
 if __name__ == "__main__":

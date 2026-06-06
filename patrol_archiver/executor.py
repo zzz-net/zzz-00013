@@ -7,7 +7,7 @@ from typing import List
 
 from .config import ArchiverConfig
 from .planner import ArchivePlan, FileAction
-from .storage import Batch, FileActionRecord, StateStore
+from .storage import Batch, FileActionRecord, PlanSummary, StateStore
 
 
 class ExecutorError(Exception):
@@ -28,9 +28,48 @@ class Executor:
             "target_pattern": self.cfg.target_pattern,
         }
 
+    @staticmethod
+    def _plan_to_summary(plan: ArchivePlan) -> PlanSummary:
+        missing = [
+            {
+                "line_no": m.line_no,
+                "device_id": m.device_id,
+                "point": m.point,
+                "date": m.date,
+                "photo_name": m.photo_name,
+            }
+            for m in plan.missing
+        ]
+        extra_files = [str(p) for p in plan.extra_files]
+        duplicate_targets = {
+            tgt: [
+                {
+                    "line_no": rec.line_no,
+                    "device_id": rec.device_id,
+                    "point": rec.point,
+                    "date": rec.date,
+                    "photo_name": rec.photo_name,
+                    "source": str(src),
+                }
+                for rec, src in items
+            ]
+            for tgt, items in plan.duplicate_targets.items()
+        }
+        path_conflicts = [
+            {"target": str(tgt), "reason": reason}
+            for tgt, reason in plan.path_conflicts
+        ]
+        return PlanSummary(
+            missing=missing,
+            extra_files=extra_files,
+            duplicate_targets=duplicate_targets,
+            path_conflicts=path_conflicts,
+        )
+
     def dry_run(self, plan: ArchivePlan) -> Batch:
         batch = self.store.create_batch(self._config_summary(), dry_run=True)
         batch.status = "completed"
+        batch.plan_summary = self._plan_to_summary(plan)
         for fa in plan.to_process:
             batch.actions.append(FileActionRecord(
                 source=str(fa.source),
@@ -48,6 +87,7 @@ class Executor:
 
         batch = self.store.create_batch(self._config_summary(), dry_run=False)
         batch.status = "running"
+        batch.plan_summary = self._plan_to_summary(plan)
         self.store.save_batch(batch)
 
         try:
