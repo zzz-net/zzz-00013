@@ -56,12 +56,15 @@ from .planner import generate_plan
 from .rollback import (
     RollbackError,
     detect_format,
+    export_audit_report,
     export_report,
+    format_audit_summary,
     format_batch_list,
     format_batch_summary,
     rollback_batch,
 )
 from .storage import StateStore
+from .auditor import Auditor, AuditResult
 
 
 def _resolve_config_path(config: str) -> Path:
@@ -297,6 +300,12 @@ def show_cmd(config_path: str, batch_id: str) -> None:
             if a.error:
                 click.echo(f"           错误: {a.error}")
 
+    last_audit = store.get_last_audit_for_batch(batch.batch_id)
+    if last_audit is not None:
+        click.echo("")
+        click.echo("=== 最近审计摘要 ===")
+        click.echo(format_audit_summary(last_audit))
+
 
 @main.command("export")
 @click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
@@ -339,6 +348,121 @@ def export_cmd(config_path: str, batch_id: str, output_path: str, fmt: str) -> N
         sys.exit(1)
 
     click.echo(f"已导出 [{actual_fmt.upper()}] 到: {out}")
+
+
+@main.command("audit")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
+@click.option("-b", "--batch", "batch_id", default=None, help="批次 ID，不指定则使用最近一次")
+@click.option("--json", "json_out", is_flag=True, default=False, help="以 JSON 格式输出到 stdout（不写文件）")
+@click.option("--csv", "csv_out", is_flag=True, default=False, help="以 CSV 格式输出到 stdout（不写文件）")
+@click.option("-o", "--output", "output_path", default=None, help="导出审计报告到文件 (.json 或 .csv)")
+@click.option(
+    "-f", "--format", "fmt",
+    type=click.Choice(["json", "csv", "auto"], case_sensitive=False),
+    default="auto",
+    help="导出格式：json / csv / auto（按扩展名自动识别，默认 auto）"
+)
+def audit_cmd(config_path: str, batch_id: str, json_out: bool, csv_out: bool, output_path: str, fmt: str) -> None:
+    """按批次对账审计：逐项比对状态记录与当前源目录、归档目录"""
+    try:
+        cfg = _load_and_validate(config_path)
+    except click.ClickException as e:
+        click.echo(f"错误: {e}", err=True)
+        sys.exit(1)
+
+    store = StateStore(cfg.state_dir)
+
+    if not batch_id:
+        batch_id = store.get_last_batch_id()
+        if not batch_id:
+            click.echo("错误: 未找到任何批次记录", err=True)
+            sys.exit(1)
+        click.echo(f"使用最近一次批次: {batch_id}")
+
+    batch = store.get_batch(batch_id)
+    if batch is None:
+        click.echo(f"错误: 批次不存在: {batch_id}", err=True)
+        sys.exit(1)
+
+    if batch.dry_run:
+        click.echo("提示: DRY-RUN 批次未执行实际文件操作，审计仅校验配置一致性。", err=True)
+
+    auditor = Auditor(store)
+    try:
+        result = auditor.audit(batch, cfg.source_dir, cfg.archive_dir)
+    except Exception as e:
+        click.echo(f"错误: 执行审计失败 - {e}", err=True)
+        sys.exit(1)
+
+    try:
+        store.save_audit(result)
+    except Exception as e:
+        click.echo(f"警告: 保存审计记录失败 - {e}", err=True)
+
+    has_errors = any(w.level in ("error", "risk") for w in result.warnings)
+
+    if output_path:
+        resolved_fmt = None if fmt.lower() == "auto" else fmt.lower()
+        actual_fmt = resolved_fmt or detect_format(Path(output_path))
+        try:
+            out = export_audit_report(result, Path(output_path), fmt=resolved_fmt)
+            click.echo(f"已导出审计报告 [{actual_fmt.upper()}] 到: {out}")
+        except Exception as e:
+            click.echo(f"错误: 导出审计报告失败 - {e}", err=True)
+            sys.exit(1)
+    elif json_out or csv_out:
+        requested_fmt = "json" if json_out else "csv"
+        import io as _io
+        if requested_fmt == "json":
+            import json as _json
+            click.echo(_json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            from .rollback import export_audit_csv
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", encoding="utf-8-sig") as tf:
+                tmp_path = Path(tf.name)
+            try:
+                export_audit_csv(result, tmp_path)
+                click.echo(tmp_path.read_text(encoding="utf-8-sig"))
+            finally:
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+    else:
+        click.echo("=== 批次审计报告 ===")
+        click.echo(format_audit_summary(result))
+
+        non_success = [r for r in result.file_records if r.audit_status != "success" and r.original_status in ("success", "rolled_back")]
+        if non_success:
+            click.echo("")
+            click.echo("=== 异常明细（仅非 success） ===")
+            for r in non_success:
+                mark_map = {
+                    "missing_in_archive": "[MISS-A]",
+                    "missing_in_source": "[MISS-S]",
+                    "overwritten": "[OVER]",
+                    "tampered": "[TAMP]",
+                    "rollback_risk": "[RISK]",
+                }
+                mark = mark_map.get(r.audit_status, "[?]")
+                click.echo(f"  {mark} #{r.idx} [{r.audit_status}]")
+                click.echo(f"         动作: {r.action}  原状态: {r.original_status}")
+                click.echo(f"         源:   {r.source}  {'(存在)' if r.source_exists else '(缺失)'}")
+                click.echo(f"         归档: {r.target}  {'(存在)' if r.archive_exists else '(缺失)'}")
+                if r.detail:
+                    click.echo(f"         说明: {r.detail}")
+
+        if result.extra_archive_files:
+            click.echo("")
+            click.echo(f"=== 归档目录额外文件（共 {len(result.extra_archive_files)} 个） ===")
+            for p in result.extra_archive_files[:20]:
+                click.echo(f"  {p}")
+            if len(result.extra_archive_files) > 20:
+                click.echo(f"  ... 省略 {len(result.extra_archive_files) - 20} 个")
+
+        if has_errors:
+            sys.exit(5)
 
 
 if __name__ == "__main__":

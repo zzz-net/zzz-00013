@@ -6,7 +6,7 @@ import json
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from .storage import Batch, FileActionRecord, StateStore
 
@@ -346,4 +346,230 @@ def format_batch_list(batches: List[Batch]) -> str:
             f"{b.batch_id}  {tag}  {b.status:12s}  {b.created_at}  "
             f"actions={len(b.actions)}"
         )
+    return "\n".join(lines)
+
+
+AUDIT_SUMMARY_FIELDS = [
+    "audit_id",
+    "batch_id",
+    "created_at",
+    "source_dir",
+    "archive_dir",
+    "config_path_changed",
+    "success",
+    "missing_in_archive",
+    "missing_in_source",
+    "overwritten",
+    "tampered",
+    "rollback_risk",
+    "original_failed",
+    "original_pending",
+    "extra_archive_files",
+    "warnings_total",
+]
+
+AUDIT_FILE_FIELDS = [
+    "section",
+    "audit_id",
+    "batch_id",
+    "idx",
+    "original_status",
+    "audit_status",
+    "action",
+    "source",
+    "target",
+    "source_exists",
+    "archive_exists",
+    "signature_match",
+    "detail",
+]
+
+AUDIT_WARNING_FIELDS = [
+    "section",
+    "audit_id",
+    "batch_id",
+    "idx",
+    "level",
+    "code",
+    "message",
+]
+
+AUDIT_EXTRA_FIELDS = [
+    "section",
+    "audit_id",
+    "batch_id",
+    "idx",
+    "path",
+]
+
+AUDIT_CONFIG_DIFF_FIELDS = [
+    "section",
+    "audit_id",
+    "batch_id",
+    "idx",
+    "config_key",
+    "batch_value",
+    "current_value",
+]
+
+
+def _build_audit_summary_row(audit: Any) -> dict:
+    counts = audit.counts or {}
+    warnings_total = len(audit.warnings) if audit.warnings else 0
+    return {
+        "audit_id": audit.audit_id,
+        "batch_id": audit.batch_id,
+        "created_at": audit.created_at,
+        "source_dir": audit.source_dir,
+        "archive_dir": audit.archive_dir,
+        "config_path_changed": "true" if audit.config_path_changed else "false",
+        "success": counts.get("success", 0),
+        "missing_in_archive": counts.get("missing_in_archive", 0),
+        "missing_in_source": counts.get("missing_in_source", 0),
+        "overwritten": counts.get("overwritten", 0),
+        "tampered": counts.get("tampered", 0),
+        "rollback_risk": counts.get("rollback_risk", 0),
+        "original_failed": counts.get("original_failed", 0),
+        "original_pending": counts.get("original_pending", 0),
+        "extra_archive_files": len(audit.extra_archive_files) if audit.extra_archive_files else 0,
+        "warnings_total": warnings_total,
+    }
+
+
+def export_audit_csv(audit: Any, output_path: Path) -> Path:
+    """导出审计报告 CSV：稳定字段名，包含 summary / file / warning / extra / config_diff 段"""
+    from .auditor import AuditResult
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+
+    summary = _build_audit_summary_row(audit)
+    writer.writerow(["section"] + AUDIT_SUMMARY_FIELDS)
+    writer.writerow(["audit_summary"] + [summary.get(k, "") for k in AUDIT_SUMMARY_FIELDS])
+    writer.writerow([])
+
+    writer.writerow(AUDIT_FILE_FIELDS)
+    for idx, rec in enumerate(audit.file_records, start=1):
+        writer.writerow([
+            "audit_file",
+            audit.audit_id,
+            audit.batch_id,
+            idx,
+            rec.original_status,
+            rec.audit_status,
+            rec.action,
+            rec.source,
+            rec.target,
+            "true" if rec.source_exists else "false",
+            "true" if rec.archive_exists else "false",
+            "" if rec.signature_match is None else ("true" if rec.signature_match else "false"),
+            rec.detail or "",
+        ])
+
+    writer.writerow([])
+    writer.writerow(AUDIT_WARNING_FIELDS)
+    if audit.warnings:
+        for idx, w in enumerate(audit.warnings, start=1):
+            writer.writerow([
+                "audit_warning",
+                audit.audit_id,
+                audit.batch_id,
+                idx,
+                w.level,
+                w.code,
+                w.message,
+            ])
+    else:
+        writer.writerow(["audit_warning", audit.audit_id, audit.batch_id, 0, "", "", ""])
+
+    writer.writerow([])
+    writer.writerow(AUDIT_EXTRA_FIELDS)
+    if audit.extra_archive_files:
+        for idx, p in enumerate(audit.extra_archive_files, start=1):
+            writer.writerow([
+                "audit_extra",
+                audit.audit_id,
+                audit.batch_id,
+                idx,
+                p,
+            ])
+    else:
+        writer.writerow(["audit_extra", audit.audit_id, audit.batch_id, 0, ""])
+
+    writer.writerow([])
+    writer.writerow(AUDIT_CONFIG_DIFF_FIELDS)
+    if audit.config_diff:
+        idx = 0
+        for key, pair in (audit.config_diff or {}).items():
+            idx += 1
+            writer.writerow([
+                "audit_config_diff",
+                audit.audit_id,
+                audit.batch_id,
+                idx,
+                key,
+                pair.get("batch", ""),
+                pair.get("current", ""),
+            ])
+    else:
+        writer.writerow(["audit_config_diff", audit.audit_id, audit.batch_id, 0, "", "", ""])
+
+    output_path.write_text(buf.getvalue(), encoding="utf-8-sig")
+    return output_path
+
+
+def export_audit_report(audit: Any, output_path: Path, fmt: Optional[str] = None) -> Path:
+    """导出审计报告。fmt=None 时按扩展名自动识别（json/csv）"""
+    fmt = (fmt or detect_format(output_path)).lower()
+    if fmt == "csv":
+        return export_audit_csv(audit, output_path)
+    if fmt == "json":
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(
+            json.dumps(audit.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        return output_path
+    raise ValueError(f"不支持的审计导出格式: {fmt}，请使用 json 或 csv")
+
+
+def format_audit_summary(audit: Any) -> str:
+    """格式化审计摘要用于终端输出"""
+    from .auditor import AuditResult
+    lines = []
+    lines.append(f"审计 ID: {audit.audit_id}")
+    lines.append(f"对应批次: {audit.batch_id}")
+    lines.append(f"审计时间: {audit.created_at}")
+    lines.append(f"源目录: {audit.source_dir}")
+    lines.append(f"归档目录: {audit.archive_dir}")
+
+    if audit.config_path_changed:
+        lines.append("")
+        lines.append("!!! 配置路径已变更（对账结果可能不准确） !!!")
+        for key, pair in audit.config_diff.items():
+            lines.append(f"  {key}: 批次='{pair.get('batch')}' 当前='{pair.get('current')}'")
+
+    lines.append("")
+    lines.append("=== 对账统计 ===")
+    counts = audit.counts or {}
+    lines.append(f"  [OK] 成功一致:              {counts.get('success', 0)}")
+    lines.append(f"  [MISS-A] 归档缺失:          {counts.get('missing_in_archive', 0)}")
+    lines.append(f"  [MISS-S] 源文件缺失:        {counts.get('missing_in_source', 0)}")
+    lines.append(f"  [OVER] 被覆盖/替换:         {counts.get('overwritten', 0)}")
+    lines.append(f"  [TAMP] 被篡改:              {counts.get('tampered', 0)}")
+    lines.append(f"  [RISK] 回滚风险:            {counts.get('rollback_risk', 0)}")
+    lines.append(f"  [FAIL] 原始失败动作:        {counts.get('original_failed', 0)}")
+    lines.append(f"  [PEND] 原始待执行动作:      {counts.get('original_pending', 0)}")
+    lines.append(f"  [EXTRA] 归档额外文件:       {len(audit.extra_archive_files) if audit.extra_archive_files else 0}")
+
+    if audit.warnings:
+        lines.append("")
+        lines.append("=== 警告/风险 ===")
+        for w in audit.warnings:
+            tag = {"warning": "[WARN]", "error": "[ERR]", "risk": "[RISK]"}.get(w.level, "[?]")
+            lines.append(f"  {tag} [{w.code}] {w.message}")
+
     return "\n".join(lines)

@@ -83,15 +83,21 @@ class StateStore:
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir
         self.batches_dir = state_dir / "batches"
+        self.audits_dir = state_dir / "audits"
         self.index_file = state_dir / "index.json"
         self._ensure_dirs()
 
     def _ensure_dirs(self) -> None:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.batches_dir.mkdir(parents=True, exist_ok=True)
+        self.audits_dir.mkdir(parents=True, exist_ok=True)
         if not self.index_file.exists():
             self.index_file.write_text(
-                json.dumps({"batches": [], "last_batch_id": None}, ensure_ascii=False, indent=2),
+                json.dumps(
+                    {"batches": [], "last_batch_id": None, "audits": {}, "last_audit_id": None},
+                    ensure_ascii=False,
+                    indent=2
+                ),
                 encoding="utf-8"
             )
 
@@ -168,3 +174,50 @@ class StateStore:
         if idx.get("last_batch_id") == batch_id:
             idx["last_batch_id"] = idx["batches"][0] if idx["batches"] else None
         self._write_index(idx)
+
+    def _audit_file(self, audit_id: str) -> Path:
+        return self.audits_dir / f"{audit_id}.json"
+
+    def save_audit(self, audit_result: Any) -> None:
+        """保存审计结果到持久化存储"""
+        self._audit_file(audit_result.audit_id).write_text(
+            json.dumps(audit_result.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        idx = self._read_index()
+        audits = idx.setdefault("audits", {})
+        batch_audits = audits.setdefault(audit_result.batch_id, [])
+        if audit_result.audit_id not in batch_audits:
+            batch_audits.insert(0, audit_result.audit_id)
+        idx["last_audit_id"] = audit_result.audit_id
+        self._write_index(idx)
+
+    def get_audit(self, audit_id: str) -> Optional[Any]:
+        """读取指定审计 ID 的结果"""
+        from .auditor import AuditResult
+        f = self._audit_file(audit_id)
+        if not f.exists():
+            return None
+        data = json.loads(f.read_text(encoding="utf-8"))
+        return AuditResult.from_dict(data)
+
+    def list_audits_for_batch(self, batch_id: str) -> List[str]:
+        """列出指定批次的所有审计 ID（从新到旧）"""
+        idx = self._read_index()
+        audits = idx.get("audits", {})
+        return list(audits.get(batch_id, []))
+
+    def get_last_audit_for_batch(self, batch_id: str) -> Optional[Any]:
+        """获取指定批次的最近一次审计结果"""
+        ids = self.list_audits_for_batch(batch_id)
+        if not ids:
+            return None
+        return self.get_audit(ids[0])
+
+    def get_last_audit(self) -> Optional[Any]:
+        """获取全局最近一次审计结果"""
+        idx = self._read_index()
+        aid = idx.get("last_audit_id")
+        if not aid:
+            return None
+        return self.get_audit(aid)
