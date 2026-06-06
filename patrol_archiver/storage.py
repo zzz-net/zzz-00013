@@ -205,6 +205,21 @@ class StateStore:
             return None
         return self.get_batch(bid)
 
+    def get_last_real_run_batch_id(self) -> Optional[str]:
+        """获取最近一次真实 run 的批次 ID（跳过 dry-run）。"""
+        for bid in self.list_batches():
+            batch = self.get_batch(bid)
+            if batch is not None and not batch.dry_run:
+                return bid
+        return None
+
+    def get_last_real_run_batch(self) -> Optional[Batch]:
+        """获取最近一次真实 run 的批次（跳过 dry-run）。"""
+        bid = self.get_last_real_run_batch_id()
+        if not bid:
+            return None
+        return self.get_batch(bid)
+
     def is_batch_completed(self, batch_id: str) -> bool:
         batch = self.get_batch(batch_id)
         return batch is not None and batch.status == "completed"

@@ -1332,6 +1332,253 @@ def test_handover_manifest_json_csv_content() -> None:
                 f"CSV 数据行数 ({len(rows) - 1}) 与 JSON files ({len(data['files'])}) 不一致")
 
 
+def test_handover_default_skips_dry_run() -> None:
+    """默认批次选择跳过 dry-run：先 dry-run 再 run，handover-create 不带 -b 应选 run。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+
+        r = _run_cli(ws, "dry-run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"dry-run failed: {r.stderr}")
+
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        out_dir = ws / "handover_pkg"
+        r = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(out_dir))
+        _assert(r.returncode == 0, f"handover-create failed: {r.stderr}\nstdout={r.stdout}")
+        _assert("真实 run 批次" in r.stdout or "真实run" in r.stdout,
+                f"应提示使用真实 run 批次（不含 dry-run）: {r.stdout}")
+        _assert("使用最近一次批次" not in r.stdout or "真实" in r.stdout,
+                f"提示文案应强调是真实 run: {r.stdout}")
+
+
+def test_handover_explicit_dry_run_fails() -> None:
+    """显式指定 dry-run 批次 ID 时 handover-create 应明确报错并以 11 退出。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+
+        r = _run_cli(ws, "dry-run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"dry-run failed: {r.stderr}")
+        import re
+        m = re.search(r"预演批次已保存:\s*(batch_\S+)", r.stdout)
+        _assert(m is not None, f"无法解析 dry-run 批次 ID: {r.stdout}")
+        dry_batch_id = m.group(1)
+
+        out_dir = ws / "should_fail"
+        r = _run_cli(ws, "handover-create", "-c", "config.yaml",
+                     "-b", dry_batch_id, "-o", str(out_dir))
+        _assert(r.returncode == 11,
+                f"显式 dry-run 批次应 exit=11，实际 exit={r.returncode}\nstdout={r.stdout}\nstderr={r.stderr}")
+        _assert("DRY-RUN" in r.stderr or "DRY-RUN" in r.stdout or "dry" in (r.stdout + r.stderr).lower(),
+                f"错误信息应明确指出 DRY-RUN 不允许: stderr={r.stderr}, stdout={r.stdout}")
+
+
+def test_handover_archive_missing_exit_code_13() -> None:
+    """归档文件缺失 → verify 退出码 13。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "run", "-c", "config.yaml")
+
+        out_dir = ws / "handover_pkg"
+        r = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(out_dir))
+        _assert(r.returncode == 0, f"create failed: {r.stderr}")
+
+        manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+        archive_paths = [Path(f["archive_path"]) for f in manifest["files"]]
+        existing_archives = [p for p in archive_paths if p.exists()]
+        _assert(len(existing_archives) >= 1, f"manifest 中引用的归档文件都不存在: {archive_paths}")
+        existing_archives[0].unlink()
+        _assert(not existing_archives[0].exists(), "删除归档文件失败")
+
+        r2 = _run_cli(ws, "handover-verify", "-c", "config.yaml")
+        _assert(r2.returncode == 13,
+                f"归档缺失时 verify 应 exit=13，实际 exit={r2.returncode}\nstdout={r2.stdout}\nstderr={r2.stderr}")
+        _assert("archive_path_missing" in r2.stdout or "原始归档路径已不存在" in r2.stdout,
+                f"应报告 archive_path_missing: {r2.stdout}")
+
+
+def test_handover_source_missing_exit_code_12() -> None:
+    """源文件缺失（归档完好）→ verify 退出码 12。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "run", "-c", "config.yaml")
+
+        out_dir = ws / "handover_pkg"
+        r = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(out_dir))
+        _assert(r.returncode == 0, f"create failed: {r.stderr}")
+
+        manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+        source_paths = [Path(f["source"]) for f in manifest["files"]]
+        existing_sources = [p for p in source_paths if p.exists()]
+        _assert(len(existing_sources) >= 1, f"manifest 中引用的源文件都不存在: {source_paths}")
+        existing_sources[0].unlink()
+        _assert(not existing_sources[0].exists(), "删除源文件失败")
+
+        r2 = _run_cli(ws, "handover-verify", "-c", "config.yaml")
+        _assert(r2.returncode == 12,
+                f"仅源文件缺失时 verify 应 exit=12，实际 exit={r2.returncode}\nstdout={r2.stdout}")
+        _assert("source_path_missing" in r2.stdout or "原始源路径已不存在" in r2.stdout,
+                f"应报告 source_path_missing: {r2.stdout}")
+
+
+def test_handover_verify_hash_mismatch_exit_code_12() -> None:
+    """包内文件被篡改（哈希不一致）→ verify 退出码 12。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "run", "-c", "config.yaml")
+
+        out_dir = ws / "handover_pkg"
+        r = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(out_dir))
+        _assert(r.returncode == 0, f"create failed: {r.stderr}")
+
+        pkg_files = [p for p in (out_dir / "files").rglob("*") if p.is_file()]
+        _assert(len(pkg_files) >= 1, f"包内无文件: {pkg_files}")
+        pkg_files[0].write_bytes(b"TAMPERED_" + b"Z" * 200)
+
+        r2 = _run_cli(ws, "handover-verify", "-c", "config.yaml")
+        _assert(r2.returncode == 12,
+                f"哈希不一致时 verify 应 exit=12，实际 exit={r2.returncode}\nstdout={r2.stdout}")
+        _assert("hash_mismatch" in r2.stdout or "哈希不匹配" in r2.stdout,
+                f"应报告 hash_mismatch: {r2.stdout}")
+
+
+def test_handover_manifest_corrupted_exit_code_12() -> None:
+    """manifest.json 损坏 → verify 退出码 12。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "run", "-c", "config.yaml")
+
+        out_dir = ws / "handover_pkg"
+        r = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(out_dir))
+        _assert(r.returncode == 0, f"create failed: {r.stderr}")
+
+        manifest = out_dir / "manifest.json"
+        manifest.write_text("{this is not valid json!!!!", encoding="utf-8")
+
+        r2 = _run_cli(ws, "handover-verify", "-c", "config.yaml")
+        _assert(r2.returncode == 12,
+                f"manifest 损坏时 verify 应 exit=12，实际 exit={r2.returncode}\nstdout={r2.stdout}")
+        _assert("manifest_corrupted" in r2.stdout or "无法解析" in r2.stdout,
+                f"应报告 manifest_corrupted: {r2.stdout}")
+
+
+def test_handover_verify_pure_json_no_hint() -> None:
+    """handover-verify --json 输出纯 JSON，不含 '使用最近一次交接包' 等提示文本。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "run", "-c", "config.yaml")
+        _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(ws / "pkg"))
+
+        r = _run_cli(ws, "handover-verify", "-c", "config.yaml", "--json")
+        _assert(r.returncode == 0, f"verify --json failed: {r.stderr}")
+        _assert("使用最近一次交接包" not in r.stdout,
+                f"--json 输出不应包含中文提示: {r.stdout[:300]}")
+        _assert("交接包 ID:" not in r.stdout,
+                f"--json 输出不应包含人类可读格式化文本: {r.stdout[:300]}")
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            _assert(False, f"--json 输出不是合法 JSON: {e}\n{r.stdout}")
+        for top_key in ("handover_id", "total_files", "has_errors", "exit_code", "issues"):
+            _assert(top_key in data, f"JSON 缺少顶层字段 {top_key}: {list(data.keys())}")
+        _assert(data["exit_code"] == 0, f"正常场景 exit_code 应为 0: {data['exit_code']}")
+        _assert(isinstance(data["issues"], list), f"issues 应为列表: {type(data['issues'])}")
+
+
+def test_handover_verify_pure_csv_no_hint_and_consistent() -> None:
+    """handover-verify --csv 输出纯 CSV，不含提示文本，表头字段稳定。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "run", "-c", "config.yaml")
+        _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(ws / "pkg"))
+
+        r = _run_cli(ws, "handover-verify", "-c", "config.yaml", "--csv")
+        _assert(r.returncode == 0, f"verify --csv failed: {r.stderr}")
+        _assert("使用最近一次交接包" not in r.stdout,
+                f"--csv 输出不应包含中文提示: {r.stdout[:300]}")
+        _assert("交接包 ID:" not in r.stdout,
+                f"--csv 输出不应包含人类可读格式化文本: {r.stdout[:300]}")
+
+        text = r.stdout.lstrip("\ufeff")
+        rows = list(csv.reader(io.StringIO(text)))
+        _assert(len(rows) >= 2, f"--csv 输出行数太少: {len(rows)}")
+        header = rows[0]
+        for stable in ("section", "handover_id", "level", "code", "exit_code"):
+            _assert(stable in header, f"CSV 表头缺少稳定字段 {stable}: {header}")
+
+        sections = {row[0].strip() for row in rows[1:] if row}
+        _assert("verify_summary" in sections, f"CSV 缺少 verify_summary section: {sections}")
+
+        summary_row = next(row for row in rows[1:] if row and row[0].strip() == "verify_summary")
+        exit_code_idx = header.index("exit_code")
+        _assert(summary_row[exit_code_idx] == "0",
+                f"正常场景 summary exit_code 应为 0: {summary_row}")
+
+
+def test_handover_verify_json_csv_consistency() -> None:
+    """同一校验结果 JSON 和 CSV 输出一致（handover_id、exit_code、问题数）。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "run", "-c", "config.yaml")
+        _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(ws / "pkg"))
+
+        manifest = json.loads((ws / "pkg" / "manifest.json").read_text(encoding="utf-8"))
+        source_paths = [Path(f["source"]) for f in manifest["files"]]
+        existing_sources = [p for p in source_paths if p.exists()]
+        _assert(len(existing_sources) >= 1, "没有可用源文件可删除")
+        existing_sources[0].unlink()
+
+        r_json = _run_cli(ws, "handover-verify", "-c", "config.yaml", "--json")
+        _assert(r_json.returncode == 12, f"json verify exit={r_json.returncode}")
+        data = json.loads(r_json.stdout)
+
+        r_csv = _run_cli(ws, "handover-verify", "-c", "config.yaml", "--csv")
+        _assert(r_csv.returncode == 12, f"csv verify exit={r_csv.returncode}")
+        text = r_csv.stdout.lstrip("\ufeff")
+        rows = list(csv.reader(io.StringIO(text)))
+        header = rows[0]
+        summary_row = next(row for row in rows[1:] if row and row[0].strip() == "verify_summary")
+        issue_rows = [row for row in rows[1:] if row and row[0].strip() == "verify_issue"]
+
+        hid_idx = header.index("handover_id")
+        ec_idx = header.index("exit_code")
+        _assert(summary_row[hid_idx] == data["handover_id"],
+                f"JSON/CSV handover_id 不一致: json={data['handover_id']}, csv={summary_row[hid_idx]}")
+        _assert(summary_row[ec_idx] == str(data["exit_code"]),
+                f"JSON/CSV exit_code 不一致: json={data['exit_code']}, csv={summary_row[ec_idx]}")
+        _assert(len(issue_rows) == len(data["issues"]),
+                f"JSON/CSV 问题数不一致: json={len(data['issues'])}, csv={len(issue_rows)}")
+
+
+def test_handover_duplicate_dir_preserves_original() -> None:
+    """重复目录冲突：原目录内容必须完整保留，新内容写入带后缀的目录。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "run", "-c", "config.yaml")
+
+        out_dir = ws / "handover_pkg"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "important.dat").write_text("DO_NOT_TOUCH", encoding="utf-8")
+        (out_dir / "sub").mkdir()
+        (out_dir / "sub" / "nested.txt").write_text("NESTED", encoding="utf-8")
+
+        r = _run_cli(ws, "handover-create", "-c", "config.yaml", "-o", str(out_dir))
+        _assert(r.returncode == 0, f"冲突场景应成功自动重命名: {r.stderr}")
+
+        _assert((out_dir / "important.dat").exists()
+                and (out_dir / "important.dat").read_text(encoding="utf-8") == "DO_NOT_TOUCH",
+                "原目录根文件被覆盖或删除！")
+        _assert((out_dir / "sub" / "nested.txt").exists()
+                and (out_dir / "sub" / "nested.txt").read_text(encoding="utf-8") == "NESTED",
+                "原目录嵌套文件被覆盖或删除！")
+        _assert(not (out_dir / "manifest.json").exists(),
+                "原目录中不应写入 handover 内容")
+
+        alt_dir = ws / "handover_pkg_1"
+        _assert(alt_dir.exists() and (alt_dir / "manifest.json").exists(),
+                f"自动重命名后的目录不存在或缺少 manifest: {alt_dir}")
+
+
 def main() -> int:
     tests = [
         ("跨进程持久化: list/show/export", test_cross_process_persistence),
@@ -1374,6 +1621,16 @@ def main() -> int:
         ("交接包: 跨进程/重启历史持久化 + list/show", test_handover_history_persistence),
         ("交接包: verify 缺文件失败 + 非 0 退出", test_handover_verify_missing_file_fails),
         ("交接包: manifest JSON/CSV 字段完整 + 哈希可复算", test_handover_manifest_json_csv_content),
+        ("交接包: 默认批次跳过 dry-run", test_handover_default_skips_dry_run),
+        ("交接包: 显式指定 dry-run 报错 exit=11", test_handover_explicit_dry_run_fails),
+        ("交接包: verify 归档缺失 exit=13", test_handover_archive_missing_exit_code_13),
+        ("交接包: verify 源文件缺失 exit=12", test_handover_source_missing_exit_code_12),
+        ("交接包: verify 哈希不一致 exit=12", test_handover_verify_hash_mismatch_exit_code_12),
+        ("交接包: verify manifest 损坏 exit=12", test_handover_manifest_corrupted_exit_code_12),
+        ("交接包: verify --json 纯输出无提示", test_handover_verify_pure_json_no_hint),
+        ("交接包: verify --csv 纯输出 + 稳定字段", test_handover_verify_pure_csv_no_hint_and_consistent),
+        ("交接包: verify JSON/CSV 一致性", test_handover_verify_json_csv_consistency),
+        ("交接包: 目录冲突原内容完整保留", test_handover_duplicate_dir_preserves_original),
     ]
     failed = 0
     for name, fn in tests:

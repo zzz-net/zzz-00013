@@ -86,7 +86,11 @@ from .handover import (
     format_handover_list,
     format_handover_show,
     format_verify_result,
+    resolve_batch_for_handover,
+    resolve_handover_record,
     verify_handover,
+    verify_result_to_csv,
+    verify_result_to_json,
 )
 
 
@@ -1004,7 +1008,7 @@ def doctor_export_cmd(
 
 @main.command("handover-create")
 @click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
-@click.option("-b", "--batch", "batch_id", default=None, help="批次 ID，不指定则使用最近一次 run 批次")
+@click.option("-b", "--batch", "batch_id", default=None, help="批次 ID，不指定则使用最近一次真实 run 批次（跳过 dry-run）")
 @click.option("-o", "--output", "output_dir", required=True, help="交接包输出目录（已存在时自动追加序号）")
 def handover_create_cmd(config_path: str, batch_id: str, output_dir: str) -> None:
     """生成归档交接包（离线包，含 manifest、报告副本和 README）"""
@@ -1017,20 +1021,17 @@ def handover_create_cmd(config_path: str, batch_id: str, output_dir: str) -> Non
     store = StateStore(cfg.state_dir)
     handover_store = HandoverStore(cfg.state_dir)
 
-    if not batch_id:
-        batch_id = store.get_last_batch_id()
-        if not batch_id:
-            click.echo("错误: 未找到任何批次记录", err=True)
-            sys.exit(1)
-        click.echo(f"使用最近一次批次: {batch_id}")
+    try:
+        batch = resolve_batch_for_handover(store, batch_id)
+    except HandoverError as e:
+        click.echo(f"错误: {e}", err=True)
+        sys.exit(11)
 
-    batch = store.get_batch(batch_id)
-    if batch is None:
-        click.echo(f"错误: 批次不存在: {batch_id}", err=True)
-        sys.exit(1)
+    if not batch_id:
+        click.echo(f"使用最近一次真实 run 批次: {batch.batch_id}")
 
     try:
-        record, actual_dir = create_handover(
+        record, actual_dir, renamed = create_handover(
             state_store=store,
             handover_store=handover_store,
             batch=batch,
@@ -1044,8 +1045,8 @@ def handover_create_cmd(config_path: str, batch_id: str, output_dir: str) -> Non
         click.echo(f"错误: 生成交接包失败 - {e}", err=True)
         sys.exit(1)
 
-    if str(actual_dir.resolve()) != str(Path(output_dir).resolve()):
-        click.echo(f"提示: 输出目录已存在，已自动改用: {actual_dir}")
+    if renamed:
+        click.echo(f"提示: 输出目录已存在且非空，已自动改用: {actual_dir}")
 
     click.echo(f"交接包已生成: {actual_dir}")
     click.echo(f"交接包 ID: {record.handover_id}")
@@ -1101,17 +1102,14 @@ def handover_show_cmd(config_path: str, handover_id: str) -> None:
 
     store = HandoverStore(cfg.state_dir)
 
-    if not handover_id:
-        handover_id = store.get_last_handover_id()
-        if not handover_id:
-            click.echo("错误: 未找到任何交接包记录", err=True)
-            sys.exit(1)
-        click.echo(f"使用最近一次交接包: {handover_id}")
+    try:
+        record = resolve_handover_record(store, handover_id)
+    except HandoverError as e:
+        click.echo(f"错误: {e}", err=True)
+        sys.exit(11)
 
-    record = store.get_handover(handover_id)
-    if record is None:
-        click.echo(f"错误: 交接包不存在: {handover_id}", err=True)
-        sys.exit(1)
+    if not handover_id:
+        click.echo(f"使用最近一次交接包: {record.handover_id}")
 
     click.echo(format_handover_show(record))
 
@@ -1119,8 +1117,12 @@ def handover_show_cmd(config_path: str, handover_id: str) -> None:
 @main.command("handover-verify")
 @click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
 @click.option("-d", "--handover", "handover_id", default=None, help="交接包 ID，不指定则使用最近一次")
-def handover_verify_cmd(config_path: str, handover_id: str) -> None:
+@click.option("--json", "json_out", is_flag=True, default=False, help="以 JSON 格式输出到 stdout（纯输出，不夹杂提示文本）")
+@click.option("--csv", "csv_out", is_flag=True, default=False, help="以 CSV 格式输出到 stdout（纯输出，不夹杂提示文本）")
+def handover_verify_cmd(config_path: str, handover_id: str, json_out: bool, csv_out: bool) -> None:
     """校验交接包：验证清单内文件、哈希、源/归档路径是否匹配"""
+    pure_output = json_out or csv_out
+
     try:
         cfg = load_config(config_path)
     except Exception as e:
@@ -1129,23 +1131,30 @@ def handover_verify_cmd(config_path: str, handover_id: str) -> None:
 
     store = HandoverStore(cfg.state_dir)
 
-    if not handover_id:
-        handover_id = store.get_last_handover_id()
-        if not handover_id:
-            click.echo("错误: 未找到任何交接包记录", err=True)
-            sys.exit(1)
-        click.echo(f"使用最近一次交接包: {handover_id}")
+    try:
+        record = resolve_handover_record(store, handover_id)
+    except HandoverError as e:
+        click.echo(f"错误: {e}", err=True)
+        sys.exit(11)
 
-    record = store.get_handover(handover_id)
-    if record is None:
-        click.echo(f"错误: 交接包不存在: {handover_id}", err=True)
+    if not handover_id and not pure_output:
+        click.echo(f"使用最近一次交接包: {record.handover_id}")
+
+    try:
+        result = verify_handover(record)
+    except Exception as e:
+        click.echo(f"错误: 校验过程异常 - {e}", err=True)
         sys.exit(1)
 
-    result = verify_handover(record)
-    click.echo(format_verify_result(result))
+    if json_out:
+        click.echo(verify_result_to_json(result))
+    elif csv_out:
+        click.echo(verify_result_to_csv(result))
+    else:
+        click.echo(format_verify_result(result))
 
     if result.has_errors:
-        sys.exit(12)
+        sys.exit(result.exit_code)
 
 
 if __name__ == "__main__":

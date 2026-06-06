@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import shutil
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -25,6 +26,79 @@ from .storage import (
 )
 
 
+def resolve_batch_for_handover(
+    state_store: StateStore,
+    batch_id: Optional[str] = None,
+) -> Batch:
+    """共享流程：为 handover-create 解析目标批次。
+
+    规则:
+      - 未指定 batch_id 时，使用最近一次 **真实 run**（跳过 dry-run）
+      - 指定 batch_id 时，若指向 dry-run → 直接报错
+      - 批次不存在 / 状态不允许 → 报错
+
+    返回解析到的 Batch 对象，失败抛 HandoverError。
+    """
+    if batch_id:
+        batch = state_store.get_batch(batch_id)
+        if batch is None:
+            raise HandoverError(f"批次不存在: {batch_id}")
+        if batch.dry_run:
+            raise HandoverError(f"DRY-RUN 批次无法生成交接包: {batch_id}")
+    else:
+        batch = state_store.get_last_real_run_batch()
+        if batch is None:
+            raise HandoverError("未找到任何已执行的真实 run 批次")
+
+    if batch.status not in ("completed", "rolled_back"):
+        raise HandoverError(
+            f"批次状态不允许生成交接包，当前状态: {batch.status}"
+        )
+    return batch
+
+
+def resolve_handover_output_dir(base_dir: Path) -> Tuple[Path, bool]:
+    """共享流程：解析交接包输出目录。
+
+    若目录不存在或为空 → 直接使用；若已存在且非空 → 自动追加 _1/_2/... 后缀。
+
+    返回 (实际使用的目录路径, 是否发生了自动重命名)。
+    """
+    base_dir = Path(base_dir).resolve()
+    if not base_dir.exists():
+        base_dir.mkdir(parents=True, exist_ok=True)
+        return base_dir, False
+    if not any(base_dir.iterdir()):
+        return base_dir, False
+
+    suffix = 1
+    while True:
+        candidate = base_dir.parent / f"{base_dir.name}_{suffix}"
+        if not candidate.exists():
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate, True
+        suffix += 1
+
+
+def resolve_handover_record(
+    handover_store: HandoverStore,
+    handover_id: Optional[str] = None,
+) -> HandoverRecord:
+    """共享流程：为 handover-show / handover-verify 解析交接包记录。
+
+    未指定 handover_id 时使用最近一次；不存在则抛 HandoverError。
+    """
+    if handover_id:
+        record = handover_store.get_handover(handover_id)
+        if record is None:
+            raise HandoverError(f"交接包不存在: {handover_id}")
+    else:
+        record = handover_store.get_last_handover()
+        if record is None:
+            raise HandoverError("未找到任何交接包记录")
+    return record
+
+
 def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     """计算文件 SHA-256 哈希"""
     h = hashlib.sha256()
@@ -35,22 +109,6 @@ def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
                 break
             h.update(chunk)
     return h.hexdigest()
-
-
-def _resolve_unique_output_dir(base_dir: Path) -> Path:
-    """如果输出目录已存在，自动追加序号直到唯一。
-    返回最终使用的目录路径（已创建）。"""
-    if not base_dir.exists():
-        base_dir.mkdir(parents=True, exist_ok=True)
-        return base_dir
-
-    suffix = 1
-    while True:
-        candidate = base_dir.parent / f"{base_dir.name}_{suffix}"
-        if not candidate.exists():
-            candidate.mkdir(parents=True, exist_ok=True)
-            return candidate
-        suffix += 1
 
 
 def _collect_success_files(batch: Batch) -> List[FileActionRecord]:
@@ -232,7 +290,7 @@ def create_handover(
     batch: Batch,
     output_dir: Path,
     archive_dir: Path,
-) -> Tuple[HandoverRecord, Path]:
+) -> Tuple[HandoverRecord, Path, bool]:
     """创建交接包。
 
     参数:
@@ -243,25 +301,13 @@ def create_handover(
         archive_dir: 归档根目录（用于计算相对路径）
 
     返回:
-        (HandoverRecord, 实际使用的输出目录路径)
+        (HandoverRecord, 实际使用的输出目录路径, 是否因冲突自动重命名)
     """
-    if batch.dry_run:
-        raise HandoverError(f"DRY-RUN 批次无法生成交接包: {batch.batch_id}")
-    if batch.status not in ("completed", "rolled_back"):
-        raise HandoverError(
-            f"批次状态不允许生成交接包，当前状态: {batch.status}"
-        )
-
     success_files = _collect_success_files(batch)
     if not success_files:
         raise HandoverError(f"批次中没有成功归档的文件: {batch.batch_id}")
 
-    output_dir = Path(output_dir).resolve()
-    if output_dir.exists() and any(output_dir.iterdir()):
-        actual_dir = _resolve_unique_output_dir(output_dir)
-    else:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        actual_dir = output_dir
+    actual_dir, renamed = resolve_handover_output_dir(output_dir)
 
     handover_id = f"handover_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
 
@@ -286,7 +332,7 @@ def create_handover(
     )
     handover_store.save_handover(record)
 
-    return record, actual_dir
+    return record, actual_dir, renamed
 
 
 def format_handover_list(records: List[HandoverRecord]) -> str:
@@ -354,6 +400,26 @@ class VerifyResult:
     def has_errors(self) -> bool:
         return any(i.level == "error" for i in self.issues)
 
+    @property
+    def error_codes(self) -> List[str]:
+        """所有 error 级别问题的 code 去重列表。"""
+        return sorted({i.code for i in self.issues if i.level == "error"})
+
+    @property
+    def exit_code(self) -> int:
+        """根据错误类型返回合适的退出码（0 = 全通过）。
+
+        分类:
+          12 = 一般性校验失败（源文件缺失、哈希不一致、manifest 异常 等）
+          13 = 归档路径缺失（交接包引用的原始归档文件已不存在）
+        """
+        if not self.has_errors:
+            return 0
+        codes = self.error_codes
+        if "archive_path_missing" in codes:
+            return 13
+        return 12
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "handover_id": self.handover_id,
@@ -361,8 +427,59 @@ class VerifyResult:
             "total_files": self.total_files,
             "checked_files": self.checked_files,
             "has_errors": self.has_errors,
+            "error_codes": self.error_codes,
+            "exit_code": self.exit_code,
             "issues": [i.to_dict() for i in self.issues],
         }
+
+
+def verify_result_to_json(result: VerifyResult) -> str:
+    """纯 JSON 输出（不夹杂任何提示文本，可管道到 jq 等工具）。"""
+    return json.dumps(result.to_dict(), ensure_ascii=False, indent=2)
+
+
+def verify_result_to_csv(result: VerifyResult) -> str:
+    """纯 CSV 输出（不夹杂任何提示文本，带 UTF-8 BOM）。
+
+    用 section 字段区分:
+      - verify_summary: 整体摘要（1 行）
+      - verify_issue: 每个问题一行
+    """
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+    writer.writerow([
+        "section", "handover_id", "created_at", "idx",
+        "level", "code", "message",
+        "total_files", "checked_files", "has_errors", "exit_code",
+    ])
+    writer.writerow([
+        "verify_summary",
+        result.handover_id,
+        result.created_at,
+        "",
+        "",
+        "",
+        "",
+        result.total_files,
+        result.checked_files,
+        result.has_errors,
+        result.exit_code,
+    ])
+    for idx, issue in enumerate(result.issues, start=1):
+        writer.writerow([
+            "verify_issue",
+            result.handover_id,
+            result.created_at,
+            idx,
+            issue.level,
+            issue.code,
+            issue.message,
+            "",
+            "",
+            "",
+            "",
+        ])
+    return "\ufeff" + buf.getvalue()
 
 
 def verify_handover(record: HandoverRecord) -> VerifyResult:
@@ -447,7 +564,7 @@ def verify_handover(record: HandoverRecord) -> VerifyResult:
         archive_path = Path(entry.archive_path)
         if not archive_path.exists():
             issues.append(VerifyIssue(
-                level="warning",
+                level="error",
                 code="archive_path_missing",
                 message=f"原始归档路径已不存在: {entry.archive_path}",
                 entry_idx=entry.idx,
@@ -476,7 +593,7 @@ def verify_handover(record: HandoverRecord) -> VerifyResult:
         source_path = Path(entry.source)
         if not source_path.exists():
             issues.append(VerifyIssue(
-                level="warning",
+                level="error",
                 code="source_path_missing",
                 message=f"原始源路径已不存在: {entry.source}",
                 entry_idx=entry.idx,
