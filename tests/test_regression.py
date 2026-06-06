@@ -193,12 +193,86 @@ def test_show_displays_export_paths() -> None:
                 f"export 未提示导出位置: {r.stdout}")
 
 
+def test_readme_export_commands() -> None:
+    """精确按 README 给出的两条命令运行，验证 JSON 不退化、CSV 内容完整。
+
+    README 命令：
+      python -m patrol_archiver export -c config.yaml -o batch_report.json
+      python -m patrol_archiver export -c config.yaml -o batch_report.csv
+    """
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        # 1) README: JSON 命令
+        json_out = ws / "batch_report.json"
+        r = _run_cli(ws, "export", "-c", "config.yaml", "-o", str(json_out))
+        _assert(r.returncode == 0, f"README JSON export failed: {r.stderr}")
+        _assert("[JSON]" in r.stdout.upper() or "json" in r.stdout.lower(),
+                f"JSON 导出未提示格式: {r.stdout}")
+        _assert(json_out.exists() and json_out.stat().st_size > 0, "JSON 文件未生成")
+        data = json.loads(json_out.read_text(encoding="utf-8"))
+        for key in ("batch_id", "status", "config_summary", "actions", "plan_summary"):
+            _assert(key in data, f"JSON 退化: 缺少字段 {key}")
+        ps = data.get("plan_summary", {})
+        for key in ("missing", "extra_files", "duplicate_targets", "path_conflicts"):
+            _assert(key in ps, f"JSON plan_summary 退化: 缺少 {key}")
+        _assert(len(data["actions"]) >= 8, "JSON actions 数量异常")
+
+        # 2) README: CSV 命令
+        csv_out = ws / "batch_report.csv"
+        r = _run_cli(ws, "export", "-c", "config.yaml", "-o", str(csv_out))
+        _assert(r.returncode == 0, f"README CSV export failed: {r.stderr}")
+        _assert("[CSV]" in r.stdout.upper() or "csv" in r.stdout.lower(),
+                f"CSV 导出未提示格式: {r.stdout}")
+        _assert("batch_report.csv" in r.stdout, f"CSV 导出未显示输出位置: {r.stdout}")
+        _assert(csv_out.exists() and csv_out.stat().st_size > 0, "CSV 文件未生成")
+
+        text = csv_out.read_text(encoding="utf-8-sig")
+        rows = list(csv.reader(io.StringIO(text)))
+        _assert(len(rows) >= 5, "CSV 行数太少，缺少数据段")
+
+        sections_seen = set()
+        summary_row = None
+        for row in rows:
+            if not row:
+                continue
+            first = row[0].strip()
+            if first in ("summary", "action", "missing", "extra_file",
+                         "duplicate_target", "path_conflict", "section"):
+                sections_seen.add(first)
+                if first == "summary" and summary_row is None and row[0] != "section":
+                    summary_row = row
+
+        _assert("action" in sections_seen, "CSV 缺少 action section")
+        _assert("summary" in sections_seen, "CSV 缺少 summary section")
+        _assert("extra_file" in sections_seen, "CSV 缺少 extra_file section（示例含 EXTRA_orphan.jpg）")
+
+        # summary 字段名稳定：首行表头必须包含 batch_id/status/actions_total 等
+        header = rows[0]
+        for stable in ("batch_id", "status", "actions_total", "missing_count"):
+            _assert(stable in header, f"CSV summary 表头缺少稳定字段 {stable}: {header}")
+
+        # actions 表头必须包含 source/target/status/action
+        action_header = None
+        for row in rows:
+            if row and row[0] == "section" and "source" in row and "target" in row:
+                action_header = row
+                break
+        _assert(action_header is not None, "CSV 未找到 action 表头")
+        for stable in ("section", "batch_id", "idx", "status", "action", "source", "target"):
+            _assert(stable in action_header,
+                    f"CSV action 表头缺少稳定字段 {stable}: {action_header}")
+
+
 def main() -> int:
     tests = [
         ("跨进程持久化: list/show/export", test_cross_process_persistence),
         ("JSON/CSV 导出: 字段完整 + 自动/显式格式", test_export_json_and_csv),
         ("Windows GBK 编码安全: show 不崩", test_windows_gbk_encoding_safety),
         ("show/export 显示路径", test_show_displays_export_paths),
+        ("README 命令一致性: JSON+CSV 双命令 + 字段稳定", test_readme_export_commands),
     ]
     failed = 0
     for name, fn in tests:

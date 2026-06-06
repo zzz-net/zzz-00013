@@ -107,9 +107,34 @@ python -m patrol_archiver show -c config.yaml
 
 ### 4. 导出报告
 
+按扩展名自动识别导出格式，JSON 和 CSV 两条命令都可以直接运行：
+
 ```bash
+# 导出 JSON（包含完整 Batch 结构，含 plan_summary 所有字段）
 python -m patrol_archiver export -c config.yaml -o batch_report.json
+
+# 导出 CSV（Excel/Numbers 可直接打开，UTF-8-BOM）
+python -m patrol_archiver export -c config.yaml -o batch_report.csv
+
+# 也可以显式指定格式（覆盖扩展名推断）
+python -m patrol_archiver export -c config.yaml -o batch.txt -f csv
+python -m patrol_archiver export -c config.yaml -o batch.txt -f json
 ```
+
+执行后 CLI 会提示实际格式和输出位置，例如：`已导出 [CSV] 到: .../batch_report.csv`。
+
+**CSV 报告包含的内容**（用 `section` 字段分区，表头字段名稳定）：
+
+| section 值 | 含义 | 主要字段 |
+|------------|------|----------|
+| `summary` | 批次摘要（1 行） | batch_id、created_at、status、mode、action、source_dir、archive_dir、csv_path、target_pattern、actions_total、actions_success、actions_failed、actions_pending、actions_rolled_back、missing_count、extra_files_count、duplicate_targets_count、path_conflicts_count、report_path、error |
+| `action` | 每条文件动作 | idx、status、action、source、target、error |
+| `missing` | 缺图：清单有但源目录没有 | idx、line_no、device_id、point、date、photo_name |
+| `extra_file` | 清单外文件：源目录有但不在清单 | idx、source |
+| `duplicate_target` | 重复目标名：两行 CSV 落到同一归档名 | idx、line_no、device_id、point、date、photo_name、source、target |
+| `path_conflict` | 路径冲突：目标文件已存在或其他冲突 | idx、target、reason |
+
+**JSON 报告**：完整 `Batch` 对象序列化，字段与 CLI 内部一致，含 `config_summary`、`actions`、`plan_summary` 等。
 
 ### 5. rollback 回滚
 
@@ -203,7 +228,7 @@ python -m patrol_archiver rollback -c _mv.yaml
 | `rollback -c CONFIG [-b BATCH_ID]` | 按批次回滚 |
 | `list -c CONFIG [-n N]` | 列出批次历史（持久化） |
 | `show -c CONFIG [-b BATCH_ID]` | 显示批次详情、配置摘要、动作日志 |
-| `export -c CONFIG [-b BATCH_ID] -o OUTPUT` | 导出批次 JSON 报告 |
+| `export -c CONFIG [-b BATCH_ID] -o OUTPUT [-f json|csv|auto]` | 导出批次报告（JSON 或 CSV，默认按扩展名识别） |
 
 ## 退出码
 
