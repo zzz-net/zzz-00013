@@ -3,6 +3,7 @@ import io
 import os
 import sys
 from pathlib import Path
+from typing import List
 
 import click
 
@@ -58,13 +59,19 @@ from .rollback import (
     detect_format,
     export_audit_report,
     export_report,
+    export_template_csv,
+    export_template_json,
+    export_templates_csv,
+    export_templates_json,
     format_audit_history,
     format_audit_summary,
     format_batch_list,
     format_batch_summary,
+    format_template_list,
+    format_template_show,
     rollback_batch,
 )
-from .storage import StateStore
+from .storage import StateStore, TemplateStore, TemplateError
 from .auditor import Auditor, AuditResult
 
 
@@ -525,6 +532,310 @@ def audit_list_cmd(config_path: str, batch_id: str, limit: int) -> None:
     click.echo(f"共 {len(audit_ids)} 次审计（显示最近 {len(audits)} 个）:")
     click.echo("")
     click.echo(format_audit_history(audits))
+
+
+def _config_to_dict(cfg: ArchiverConfig) -> dict:
+    """把 ArchiverConfig 转为可序列化的 dict（路径转字符串）"""
+    return {
+        "source_dir": str(cfg.source_dir),
+        "archive_dir": str(cfg.archive_dir),
+        "csv_path": str(cfg.csv_path),
+        "state_dir": str(cfg.state_dir),
+        "photo_extensions": list(cfg.photo_extensions),
+        "action": cfg.action,
+        "target_pattern": cfg.target_pattern,
+        "csv_columns": dict(cfg.csv_columns),
+    }
+
+
+def _validate_template_for_apply(template_config: dict) -> List[str]:
+    """应用模板时的额外校验：目录、路径可写等"""
+    errors = []
+
+    source_dir = Path(template_config.get("source_dir", ""))
+    archive_dir = Path(template_config.get("archive_dir", ""))
+    csv_path = Path(template_config.get("csv_path", ""))
+    state_dir = Path(template_config.get("state_dir", ""))
+
+    if not source_dir.exists():
+        errors.append(f"源目录不存在: {source_dir}")
+    elif not source_dir.is_dir():
+        errors.append(f"源路径不是目录: {source_dir}")
+
+    if not archive_dir.parent.exists():
+        errors.append(f"归档目录的父目录不存在: {archive_dir.parent}")
+    try:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        probe = archive_dir / ".write_probe"
+        probe.write_text("probe", encoding="utf-8")
+        probe.unlink()
+    except PermissionError:
+        errors.append(f"归档目录没有写入权限: {archive_dir}")
+    except Exception as e:
+        errors.append(f"归档目录无法访问: {archive_dir} - {e}")
+
+    if not csv_path.exists():
+        errors.append(f"CSV 文件不存在: {csv_path}")
+
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        probe = state_dir / ".write_probe"
+        probe.write_text("probe", encoding="utf-8")
+        probe.unlink()
+    except PermissionError:
+        errors.append(f"状态目录没有写入权限: {state_dir}")
+    except Exception as e:
+        errors.append(f"状态目录无法访问: {state_dir} - {e}")
+
+    action = template_config.get("action")
+    if action not in ("copy", "move"):
+        errors.append(f"action 必须是 'copy' 或 'move'，当前为: {action}")
+
+    target_pattern = template_config.get("target_pattern", "")
+    if not isinstance(target_pattern, str) or not target_pattern:
+        errors.append("target_pattern 必须是非空字符串")
+    else:
+        required_placeholders = ["{device_id}", "{point}", "{date}", "{filename}"]
+        for ph in required_placeholders:
+            if ph not in target_pattern:
+                errors.append(
+                    f"target_pattern 缺少必要占位符 {ph}，当前为: {target_pattern}"
+                )
+                break
+
+    return errors
+
+
+@main.command("template-save")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
+@click.option("-n", "--name", required=True, help="模板名称")
+@click.option("-d", "--description", default="", help="模板描述")
+@click.option("--force", is_flag=True, default=False, help="同名模板强制覆盖")
+def template_save_cmd(config_path: str, name: str, description: str, force: bool) -> None:
+    """把当前 YAML 配置保存为命名模板"""
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        click.echo(f"错误: 加载配置失败 - {e}", err=True)
+        sys.exit(1)
+
+    store = TemplateStore(cfg.state_dir)
+    config_dict = _config_to_dict(cfg)
+
+    try:
+        tpl = store.save_template(name, config_dict, description=description, force=force)
+    except TemplateError as e:
+        click.echo(f"错误: {e}", err=True)
+        sys.exit(6)
+
+    if force:
+        click.echo(f"模板已覆盖保存: {tpl.name}")
+    else:
+        click.echo(f"模板已保存: {tpl.name}")
+    click.echo(f"存储位置: {store.templates_dir}")
+
+
+@main.command("template-list")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径（用于读取 state_dir）")
+@click.option("--json", "json_out", is_flag=True, default=False, help="以 JSON 格式输出到 stdout")
+@click.option("--csv", "csv_out", is_flag=True, default=False, help="以 CSV 格式输出到 stdout")
+def template_list_cmd(config_path: str, json_out: bool, csv_out: bool) -> None:
+    """列出所有已保存的配置模板"""
+    pure_output = json_out or csv_out
+
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        click.echo(f"错误: 加载配置失败 - {e}", err=True)
+        sys.exit(1)
+
+    store = TemplateStore(cfg.state_dir)
+    names = store.list_templates()
+    templates = [t for t in (store.get_template(n) for n in names) if t is not None]
+
+    if not pure_output:
+        click.echo(f"状态目录: {cfg.state_dir}")
+        click.echo(f"模板存储: {store.templates_dir}")
+        click.echo(f"共 {len(templates)} 个模板:")
+        click.echo("")
+
+    if json_out:
+        import json as _json
+        click.echo(_json.dumps([t.to_dict() for t in templates], ensure_ascii=False, indent=2))
+    elif csv_out:
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", encoding="utf-8-sig") as tf:
+            tmp_path = Path(tf.name)
+        try:
+            export_templates_csv(templates, tmp_path)
+            click.echo(tmp_path.read_text(encoding="utf-8-sig"))
+        finally:
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+    else:
+        click.echo(format_template_list(templates))
+
+
+@main.command("template-show")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径（用于读取 state_dir）")
+@click.option("-n", "--name", required=True, help="模板名称")
+@click.option("--json", "json_out", is_flag=True, default=False, help="以 JSON 格式输出到 stdout")
+def template_show_cmd(config_path: str, name: str, json_out: bool) -> None:
+    """查看单个模板的详情"""
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        click.echo(f"错误: 加载配置失败 - {e}", err=True)
+        sys.exit(1)
+
+    store = TemplateStore(cfg.state_dir)
+    tpl = store.get_template(name)
+
+    if tpl is None:
+        if store.exists(name):
+            click.echo(f"错误: 模板 '{name}' 已损坏，无法读取。"
+                       f" 备份已保存到 {store.templates_dir / (name + '.corrupted.bak')}", err=True)
+        else:
+            click.echo(f"错误: 模板不存在: {name}", err=True)
+        sys.exit(7)
+
+    if json_out:
+        import json as _json
+        click.echo(_json.dumps(tpl.to_dict(), ensure_ascii=False, indent=2))
+    else:
+        click.echo(format_template_show(tpl))
+
+
+@main.command("template-export")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径（用于读取 state_dir）")
+@click.option("-n", "--name", default=None, help="模板名称（不指定则导出全部）")
+@click.option("-o", "--output", "output_path", required=True, help="导出文件路径 (.json 或 .csv)")
+@click.option(
+    "-f", "--format", "fmt",
+    type=click.Choice(["json", "csv", "auto"], case_sensitive=False),
+    default="auto",
+    help="导出格式：json / csv / auto（按扩展名自动识别，默认 auto）"
+)
+def template_export_cmd(config_path: str, name: str, output_path: str, fmt: str) -> None:
+    """导出模板为 JSON 或 CSV"""
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        click.echo(f"错误: 加载配置失败 - {e}", err=True)
+        sys.exit(1)
+
+    store = TemplateStore(cfg.state_dir)
+
+    resolved_fmt = None if fmt.lower() == "auto" else fmt.lower()
+    actual_fmt = resolved_fmt or detect_format(Path(output_path))
+
+    if name:
+        tpl = store.get_template(name)
+        if tpl is None:
+            if store.exists(name):
+                click.echo(f"错误: 模板 '{name}' 已损坏，无法读取。", err=True)
+            else:
+                click.echo(f"错误: 模板不存在: {name}", err=True)
+            sys.exit(7)
+
+        try:
+            if actual_fmt == "csv":
+                out = export_template_csv(tpl, Path(output_path))
+            else:
+                out = export_template_json(tpl, Path(output_path))
+        except Exception as e:
+            click.echo(f"错误: 导出失败 - {e}", err=True)
+            sys.exit(1)
+    else:
+        names = store.list_templates()
+        templates = [t for t in (store.get_template(n) for n in names) if t is not None]
+        try:
+            if actual_fmt == "csv":
+                out = export_templates_csv(templates, Path(output_path))
+            else:
+                out = export_templates_json(templates, Path(output_path))
+        except Exception as e:
+            click.echo(f"错误: 导出失败 - {e}", err=True)
+            sys.exit(1)
+
+    click.echo(f"已导出模板 [{actual_fmt.upper()}] 到: {out}")
+
+
+@main.command("template-apply")
+@click.option("-c", "--config", "config_path", required=True, help="输出 YAML 配置文件路径")
+@click.option("-s", "--state-dir", "state_dir_path", required=True, help="状态目录路径（模板存储位置）")
+@click.option("-n", "--name", required=True, help="模板名称")
+@click.option("--force", is_flag=True, default=False, help="输出文件已存在时强制覆盖")
+def template_apply_cmd(config_path: str, state_dir_path: str, name: str, force: bool) -> None:
+    """从模板生成 YAML 配置文件（校验字段和路径）"""
+    state_dir = Path(state_dir_path).resolve()
+    if not state_dir.exists():
+        click.echo(f"错误: 状态目录不存在: {state_dir}", err=True)
+        sys.exit(1)
+
+    store = TemplateStore(state_dir)
+    tpl = store.get_template(name)
+
+    if tpl is None:
+        if store.exists(name):
+            click.echo(f"错误: 模板 '{name}' 已损坏，无法读取。"
+                       f" 备份已保存到 {store.templates_dir / (name + '.corrupted.bak')}", err=True)
+        else:
+            click.echo(f"错误: 模板不存在: {name}", err=True)
+        sys.exit(7)
+
+    template_config = tpl.config or {}
+
+    field_errors = TemplateStore.validate_template_config(template_config)
+    if field_errors:
+        click.echo("错误: 模板字段校验失败:", err=True)
+        for e in field_errors:
+            click.echo(f"  - {e}", err=True)
+        sys.exit(8)
+
+    path_errors = _validate_template_for_apply(template_config)
+    if path_errors:
+        click.echo("警告: 模板路径存在问题（文件仍将生成，但后续 run 可能失败）:", err=True)
+        for e in path_errors:
+            click.echo(f"  - {e}", err=True)
+
+    out_path = Path(config_path).resolve()
+    if out_path.exists() and not force:
+        click.echo(f"错误: 输出文件已存在: {out_path}。使用 --force 强制覆盖。", err=True)
+        sys.exit(6)
+
+    try:
+        out_parent = out_path.parent
+        out_parent.mkdir(parents=True, exist_ok=True)
+        probe = out_parent / ".write_probe"
+        probe.write_text("probe", encoding="utf-8")
+        probe.unlink()
+    except PermissionError:
+        click.echo(f"错误: 输出目录没有写入权限: {out_parent}", err=True)
+        sys.exit(9)
+    except Exception as e:
+        click.echo(f"错误: 无法写入输出目录: {out_parent} - {e}", err=True)
+        sys.exit(9)
+
+    import yaml as _yaml
+    out_config = {}
+    for key in ("source_dir", "archive_dir", "csv_path", "state_dir",
+                "photo_extensions", "action", "target_pattern", "csv_columns"):
+        if key in template_config:
+            out_config[key] = template_config[key]
+
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            _yaml.dump(out_config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    except Exception as e:
+        click.echo(f"错误: 写入配置文件失败 - {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"已从模板 '{name}' 生成配置: {out_path}")
+    if path_errors:
+        click.echo("注意: 上述路径问题需手动修复后再执行 run/dry-run。", err=True)
 
 
 if __name__ == "__main__":

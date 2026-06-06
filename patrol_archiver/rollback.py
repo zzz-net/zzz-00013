@@ -6,7 +6,7 @@ import json
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from .storage import Batch, FileActionRecord, StateStore
 
@@ -599,4 +599,157 @@ def format_audit_history(audits: List[Any]) -> str:
             f"OK={counts.get('success', 0)}  ISSUES={total_issues}  "
             f"WARN={warnings_total}  EXTRA={len(a.extra_archive_files) if a.extra_archive_files else 0}"
         )
+    return "\n".join(lines)
+
+
+TEMPLATE_SUMMARY_FIELDS = [
+    "name",
+    "created_at",
+    "updated_at",
+    "description",
+]
+
+TEMPLATE_CONFIG_FIELDS = [
+    "section",
+    "name",
+    "idx",
+    "config_key",
+    "config_value",
+]
+
+
+def _template_config_rows(template: Any) -> List[Dict[str, Any]]:
+    from .storage import ConfigTemplate
+    rows = []
+    config = template.config or {}
+    idx = 0
+    for key, value in config.items():
+        idx += 1
+        if isinstance(value, (list, dict)):
+            val_str = json.dumps(value, ensure_ascii=False)
+        else:
+            val_str = str(value)
+        rows.append({
+            "section": "template_config",
+            "name": template.name,
+            "idx": idx,
+            "config_key": key,
+            "config_value": val_str,
+        })
+    return rows
+
+
+def export_template_csv(template: Any, output_path: Path) -> Path:
+    """导出单个模板为 CSV：包含模板摘要 + 配置键值对"""
+    from .storage import ConfigTemplate
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+
+    writer.writerow(["section"] + TEMPLATE_SUMMARY_FIELDS)
+    writer.writerow([
+        "template_summary",
+        template.name,
+        template.created_at,
+        template.updated_at,
+        template.description or "",
+    ])
+    writer.writerow([])
+
+    writer.writerow(TEMPLATE_CONFIG_FIELDS)
+    for row in _template_config_rows(template):
+        writer.writerow([
+            row["section"], row["name"], row["idx"], row["config_key"], row["config_value"]
+        ])
+
+    output_path.write_text(buf.getvalue(), encoding="utf-8-sig")
+    return output_path
+
+
+def export_template_json(template: Any, output_path: Path) -> Path:
+    """导出单个模板为 JSON"""
+    from .storage import ConfigTemplate
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(template.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    return output_path
+
+
+def export_templates_csv(templates: List[Any], output_path: Path) -> Path:
+    """导出多个模板列表为 CSV"""
+    from .storage import ConfigTemplate
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+
+    writer.writerow(["section"] + TEMPLATE_SUMMARY_FIELDS + ["config_keys"])
+    for tpl in templates:
+        config_keys = ",".join(sorted((tpl.config or {}).keys()))
+        writer.writerow([
+            "template_summary",
+            tpl.name,
+            tpl.created_at,
+            tpl.updated_at,
+            tpl.description or "",
+            config_keys,
+        ])
+
+    output_path.write_text(buf.getvalue(), encoding="utf-8-sig")
+    return output_path
+
+
+def export_templates_json(templates: List[Any], output_path: Path) -> Path:
+    """导出多个模板列表为 JSON"""
+    from .storage import ConfigTemplate
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps([t.to_dict() for t in templates],
+        ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    return output_path
+
+
+def format_template_list(templates: List[Any]) -> str:
+    """格式化模板列表用于终端输出"""
+    from .storage import ConfigTemplate
+    if not templates:
+        return "(无模板)"
+    lines = []
+    for tpl in templates:
+        desc = f" - {tpl.description}" if tpl.description else ""
+        lines.append(
+            f"{tpl.name}  创建: {tpl.created_at}  更新: {tpl.updated_at}{desc}"
+        )
+    return "\n".join(lines)
+
+
+def format_template_show(template: Any) -> str:
+    """格式化单个模板详情用于终端输出"""
+    from .storage import ConfigTemplate
+    lines = []
+    lines.append(f"模板名称: {template.name}")
+    lines.append(f"创建时间: {template.created_at}")
+    lines.append(f"更新时间: {template.updated_at}")
+    if template.description:
+        lines.append(f"描述: {template.description}")
+    lines.append("")
+    lines.append("配置内容:")
+    config = template.config or {}
+    for key, value in config.items():
+        if isinstance(value, (list, dict)):
+            val_str = json.dumps(value, ensure_ascii=False, indent=2)
+            lines.append(f"  {key}:")
+            for line in val_str.splitlines():
+                lines.append(f"    {line}")
+        else:
+            lines.append(f"  {key}: {value}")
     return "\n".join(lines)

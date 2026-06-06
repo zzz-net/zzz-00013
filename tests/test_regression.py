@@ -716,6 +716,217 @@ def test_multiple_audit_snapshots_track_health_change() -> None:
         _assert("ISSUES" in r.stdout, f"audit-list 未显示 ISSUES 标签: {r.stdout}")
 
 
+def test_template_save_and_list() -> None:
+    """template-save 保存后，template-list 可列出（跨进程持久化）。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+
+        r = _run_cli(ws, "template-save", "-c", "config.yaml", "-n", "daily_patrol",
+                     "-d", "日常巡检归档配置")
+        _assert(r.returncode == 0, f"template-save failed: {r.stderr}")
+        _assert("模板已保存" in r.stdout, f"template-save 未输出成功提示: {r.stdout}")
+
+        r2 = _run_cli(ws, "template-list", "-c", "config.yaml")
+        _assert(r2.returncode == 0, f"template-list failed: {r2.stderr}")
+        _assert("daily_patrol" in r2.stdout, f"template-list 未列出保存的模板: {r2.stdout}")
+
+
+def test_template_duplicate_without_force_fails() -> None:
+    """同名模板不带 --force 应失败，带 --force 应成功覆盖。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+
+        r = _run_cli(ws, "template-save", "-c", "config.yaml", "-n", "dup_test")
+        _assert(r.returncode == 0, f"首次 template-save 失败: {r.stderr}")
+
+        r2 = _run_cli(ws, "template-save", "-c", "config.yaml", "-n", "dup_test")
+        _assert(r2.returncode != 0, f"重复保存不带 --force 应失败: {r2.stdout}")
+        _assert("已存在" in r2.stderr or "已存在" in r2.stdout,
+                f"重复保存应提示已存在: stderr={r2.stderr}, stdout={r2.stdout}")
+
+        r3 = _run_cli(ws, "template-save", "-c", "config.yaml", "-n", "dup_test", "--force")
+        _assert(r3.returncode == 0, f"重复保存带 --force 应成功: {r3.stderr}")
+        _assert("已覆盖保存" in r3.stdout, f"--force 未提示覆盖: {r3.stdout}")
+
+
+def test_template_show_and_pure_json_output() -> None:
+    """template-show 展示详情，--json 输出纯 JSON 无提示文本。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+
+        _run_cli(ws, "template-save", "-c", "config.yaml", "-n", "show_test",
+                 "-d", "测试描述")
+
+        r = _run_cli(ws, "template-show", "-c", "config.yaml", "-n", "show_test")
+        _assert(r.returncode == 0, f"template-show failed: {r.stderr}")
+        _assert("模板名称: show_test" in r.stdout, f"template-show 未显示名称: {r.stdout}")
+        _assert("配置内容:" in r.stdout, f"template-show 未显示配置: {r.stdout}")
+        _assert("测试描述" in r.stdout, f"template-show 未显示描述: {r.stdout}")
+
+        r2 = _run_cli(ws, "template-show", "-c", "config.yaml", "-n", "show_test", "--json")
+        _assert(r2.returncode == 0, f"template-show --json failed: {r2.stderr}")
+        _assert("模板名称" not in r2.stdout, f"--json 输出不应包含中文提示: {r2.stdout[:200]}")
+        try:
+            data = json.loads(r2.stdout)
+        except json.JSONDecodeError as e:
+            _assert(False, f"--json 输出不是合法 JSON: {e}\n{r2.stdout}")
+        _assert(data.get("name") == "show_test", f"JSON name 字段错误: {data}")
+        _assert("config" in data, f"JSON 缺少 config 字段: {list(data.keys())}")
+
+
+def test_template_export_json_and_csv() -> None:
+    """template-export 支持 JSON/CSV，单个模板和全部模板均可导出。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+
+        _run_cli(ws, "template-save", "-c", "config.yaml", "-n", "tpl_a", "-d", "模板A")
+        _run_cli(ws, "template-save", "-c", "config.yaml", "-n", "tpl_b", "-d", "模板B")
+
+        json_single = ws / "tpl_a.json"
+        r = _run_cli(ws, "template-export", "-c", "config.yaml", "-n", "tpl_a",
+                     "-o", str(json_single))
+        _assert(r.returncode == 0, f"导出单个 JSON 失败: {r.stderr}")
+        _assert(json_single.exists() and json_single.stat().st_size > 0, "单个 JSON 未生成")
+        data = json.loads(json_single.read_text(encoding="utf-8"))
+        _assert(data.get("name") == "tpl_a", f"导出的 JSON name 错误: {data.get('name')}")
+        _assert("config" in data, "导出的 JSON 缺少 config")
+
+        csv_single = ws / "tpl_a.csv"
+        r = _run_cli(ws, "template-export", "-c", "config.yaml", "-n", "tpl_a",
+                     "-o", str(csv_single))
+        _assert(r.returncode == 0, f"导出单个 CSV 失败: {r.stderr}")
+        _assert(csv_single.exists() and csv_single.stat().st_size > 0, "单个 CSV 未生成")
+        text = csv_single.read_text(encoding="utf-8-sig")
+        _assert("template_summary" in text and "template_config" in text,
+                f"CSV 缺少 section 标记: {text[:300]}")
+
+        json_all = ws / "all_tpl.json"
+        r = _run_cli(ws, "template-export", "-c", "config.yaml", "-o", str(json_all))
+        _assert(r.returncode == 0, f"导出全部 JSON 失败: {r.stderr}")
+        data_all = json.loads(json_all.read_text(encoding="utf-8"))
+        _assert(isinstance(data_all, list) and len(data_all) >= 2,
+                f"全部导出应为列表且>=2: type={type(data_all)}, len={len(data_all) if isinstance(data_all, list) else 'N/A'}")
+
+        csv_all = ws / "all_tpl.csv"
+        r = _run_cli(ws, "template-export", "-c", "config.yaml", "-o", str(csv_all))
+        _assert(r.returncode == 0, f"导出全部 CSV 失败: {r.stderr}")
+        rows = list(csv.reader(io.StringIO(csv_all.read_text(encoding="utf-8-sig"))))
+        _assert(len(rows) >= 3, f"全部 CSV 行数太少: {len(rows)}")
+
+
+def test_template_apply_validates_and_generates_yaml() -> None:
+    """template-apply 从模板生成 YAML，校验字段、路径，已存在文件需 --force。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+
+        r = _run_cli(ws, "template-save", "-c", "config.yaml", "-n", "apply_test")
+        _assert(r.returncode == 0, f"template-save 失败: {r.stderr}")
+
+        out_cfg = ws / "from_template.yaml"
+        r = _run_cli(ws, "template-apply", "-s", ".patrol_state",
+                     "-n", "apply_test", "-c", str(out_cfg))
+        _assert(r.returncode == 0, f"template-apply 失败: {r.stderr}")
+        _assert(out_cfg.exists(), f"template-apply 未生成 YAML: {out_cfg}")
+        content = out_cfg.read_text(encoding="utf-8")
+        _assert("source_dir" in content and "archive_dir" in content,
+                f"生成的 YAML 缺少关键字段: {content}")
+
+        r2 = _run_cli(ws, "template-apply", "-s", ".patrol_state",
+                      "-n", "apply_test", "-c", str(out_cfg))
+        _assert(r2.returncode != 0, f"输出文件已存在时不带 --force 应失败: {r2.stdout}")
+        _assert("已存在" in r2.stderr or "已存在" in r2.stdout,
+                f"应提示文件已存在: stderr={r2.stderr}, stdout={r2.stdout}")
+
+        r3 = _run_cli(ws, "template-apply", "-s", ".patrol_state",
+                      "-n", "apply_test", "-c", str(out_cfg), "--force")
+        _assert(r3.returncode == 0, f"带 --force 应覆盖成功: {r3.stderr}")
+
+        r4 = _run_cli(ws, "dry-run", "-c", str(out_cfg))
+        _assert(r4.returncode == 0, f"从模板生成的配置应能正常 dry-run: {r4.stderr}")
+
+
+def test_template_bad_data_and_corruption() -> None:
+    """模板损坏、字段缺失、不存在时给出清晰错误。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        state_dir = ws / ".patrol_state"
+        tpl_dir = state_dir / "templates"
+        tpl_dir.mkdir(parents=True, exist_ok=True)
+
+        r = _run_cli(ws, "template-show", "-c", "config.yaml", "-n", "no_such")
+        _assert(r.returncode != 0, f"不存在的模板 template-show 应失败: {r.stdout}")
+        _assert("不存在" in r.stderr or "不存在" in r.stdout,
+                f"应提示模板不存在: stderr={r.stderr}, stdout={r.stdout}")
+
+        corrupted = tpl_dir / "broken.json"
+        corrupted.write_text("{this is not valid json!!!", encoding="utf-8")
+        (tpl_dir / "index.json").write_text(
+            json.dumps({"templates": ["broken"]}, ensure_ascii=False),
+            encoding="utf-8"
+        )
+        r2 = _run_cli(ws, "template-show", "-c", "config.yaml", "-n", "broken")
+        _assert(r2.returncode != 0, f"损坏的模板 template-show 应失败: {r2.stdout}")
+        _assert("损坏" in r2.stderr or "损坏" in r2.stdout,
+                f"应提示模板损坏: stderr={r2.stderr}, stdout={r2.stdout}")
+        bak_file = tpl_dir / "broken.corrupted.bak"
+        _assert(bak_file.exists(), f"损坏模板应生成备份: {bak_file}")
+
+        from patrol_archiver.storage import TemplateStore
+        store = TemplateStore(state_dir)
+        bad_cfg = {"action": "invalid_action", "target_pattern": ""}
+        store.save_template("field_missing", bad_cfg, force=False)
+        out_bad = ws / "bad_cfg.yaml"
+        r3 = _run_cli(ws, "template-apply", "-s", str(state_dir),
+                      "-n", "field_missing", "-c", str(out_bad))
+        _assert(r3.returncode != 0,
+                f"字段缺失/非法的模板 apply 应失败: stdout={r3.stdout}\nstderr={r3.stderr}")
+        _assert("缺少必填字段" in r3.stderr or "缺少必填字段" in r3.stdout
+                or "校验失败" in r3.stderr or "校验失败" in r3.stdout,
+                f"应提示字段校验失败: stderr={r3.stderr}, stdout={r3.stdout}")
+
+
+def test_template_list_pure_json_csv_output() -> None:
+    """template-list --json / --csv 输出纯净，不夹杂提示文本。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "template-save", "-c", "config.yaml", "-n", "pure_test")
+
+        r = _run_cli(ws, "template-list", "-c", "config.yaml", "--json")
+        _assert(r.returncode == 0, f"template-list --json failed: {r.stderr}")
+        _assert("状态目录" not in r.stdout and "模板存储" not in r.stdout,
+                f"--json 输出不应包含提示文本: {r.stdout[:300]}")
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            _assert(False, f"--json 输出不是合法 JSON: {e}\n{r.stdout}")
+        _assert(isinstance(data, list), f"--json 输出应为列表: {type(data)}")
+
+        r2 = _run_cli(ws, "template-list", "-c", "config.yaml", "--csv")
+        _assert(r2.returncode == 0, f"template-list --csv failed: {r2.stderr}")
+        _assert("状态目录" not in r2.stdout, f"--csv 输出不应包含提示文本: {r2.stdout[:300]}")
+        rows = list(csv.reader(io.StringIO(r2.stdout)))
+        _assert(len(rows) >= 2, f"--csv 输出行数太少: {len(rows)}")
+
+
+def test_template_cross_process_persistence() -> None:
+    """子进程保存的模板，在另一个子进程中仍可读取（跨进程/重启持久化）。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+
+        r1 = _run_cli(ws, "template-save", "-c", "config.yaml", "-n", "cross_proc")
+        _assert(r1.returncode == 0, f"子进程1 template-save failed: {r1.stderr}")
+
+        r2 = _run_cli(ws, "template-list", "-c", "config.yaml")
+        _assert(r2.returncode == 0, f"子进程2 template-list failed: {r2.stderr}")
+        _assert("cross_proc" in r2.stdout,
+                f"子进程2 应能看到子进程1 保存的模板: {r2.stdout}")
+
+        r3 = _run_cli(ws, "template-show", "-c", "config.yaml", "-n", "cross_proc")
+        _assert(r3.returncode == 0, f"子进程3 template-show failed: {r3.stderr}")
+        _assert("模板名称: cross_proc" in r3.stdout,
+                f"子进程3 应能读取模板详情: {r3.stdout}")
+
+
 def main() -> int:
     tests = [
         ("跨进程持久化: list/show/export", test_cross_process_persistence),
@@ -736,6 +947,14 @@ def main() -> int:
         ("审计新特性: 回滚后再审计", test_audit_after_rollback),
         ("审计新特性: CSV 导出含 config_diff 稳定字段", test_audit_export_csv_contains_config_diff_section),
         ("审计新特性: 多次快照追踪健康变化", test_multiple_audit_snapshots_track_health_change),
+        ("模板: save/list 基础功能与持久化", test_template_save_and_list),
+        ("模板: 同名冲突 --force 覆盖", test_template_duplicate_without_force_fails),
+        ("模板: show 详情与 --json 纯输出", test_template_show_and_pure_json_output),
+        ("模板: export 单个/全部 JSON+CSV", test_template_export_json_and_csv),
+        ("模板: apply 校验字段、路径并生成 YAML", test_template_apply_validates_and_generates_yaml),
+        ("模板: 损坏/缺失/不存在错误处理", test_template_bad_data_and_corruption),
+        ("模板: list --json/--csv 纯输出无提示", test_template_list_pure_json_csv_output),
+        ("模板: 跨进程/重启持久化", test_template_cross_process_persistence),
     ]
     failed = 0
     for name, fn in tests:

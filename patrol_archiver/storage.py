@@ -275,3 +275,173 @@ class StateStore:
         if not aid:
             return None
         return self.get_audit(aid)
+
+
+@dataclass
+class ConfigTemplate:
+    """配置模板：保存命名的 YAML 配置快照"""
+    name: str
+    created_at: str
+    updated_at: str
+    config: Dict[str, Any]
+    description: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "config": self.config,
+            "description": self.description,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ConfigTemplate":
+        return cls(
+            name=data["name"],
+            created_at=data["created_at"],
+            updated_at=data["updated_at"],
+            config=data.get("config", {}),
+            description=data.get("description", ""),
+        )
+
+
+class TemplateStore:
+    """模板持久化存储：保存在 state_dir/templates 下"""
+
+    REQUIRED_CONFIG_FIELDS = (
+        "source_dir", "archive_dir", "csv_path", "state_dir",
+        "action", "target_pattern",
+    )
+
+    def __init__(self, state_dir: Path):
+        self.state_dir = Path(state_dir)
+        self.templates_dir = self.state_dir / "templates"
+        self.index_file = self.templates_dir / "index.json"
+        self._ensure_dirs()
+
+    def _ensure_dirs(self) -> None:
+        self.templates_dir.mkdir(parents=True, exist_ok=True)
+        if not self.index_file.exists():
+            self._write_index({"templates": []})
+
+    def _read_index(self) -> Dict[str, Any]:
+        try:
+            raw = self.index_file.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (json.JSONDecodeError, FileNotFoundError, OSError):
+            data = {"templates": []}
+            try:
+                self._write_index(data)
+            except Exception:
+                pass
+        data.setdefault("templates", [])
+        return data
+
+    def _write_index(self, data: Dict[str, Any]) -> None:
+        self.index_file.parent.mkdir(parents=True, exist_ok=True)
+        self.index_file.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+    def _template_file(self, name: str) -> Path:
+        safe_name = "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+        return self.templates_dir / f"{safe_name}.json"
+
+    def exists(self, name: str) -> bool:
+        tpl_file = self._template_file(name)
+        return tpl_file.exists()
+
+    def save_template(
+        self,
+        name: str,
+        config: Dict[str, Any],
+        description: str = "",
+        force: bool = False,
+    ) -> ConfigTemplate:
+        """保存模板。同名模板默认拒绝覆盖，force=True 时强制覆盖。"""
+        if self.exists(name) and not force:
+            raise TemplateError(
+                f"模板 '{name}' 已存在。使用 --force 强制覆盖。"
+            )
+
+        now = datetime.now().isoformat()
+        existing = self.get_template(name) if self.exists(name) else None
+        created_at = existing.created_at if existing else now
+
+        tpl = ConfigTemplate(
+            name=name,
+            created_at=created_at,
+            updated_at=now,
+            config=dict(config),
+            description=description,
+        )
+
+        tpl_file = self._template_file(name)
+        tpl_file.parent.mkdir(parents=True, exist_ok=True)
+        tpl_file.write_text(
+            json.dumps(tpl.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+        idx = self._read_index()
+        templates = idx["templates"]
+        if name not in templates:
+            templates.insert(0, name)
+        idx["templates"] = templates
+        self._write_index(idx)
+
+        return tpl
+
+    def get_template(self, name: str) -> Optional[ConfigTemplate]:
+        """读取指定名称的模板。模板损坏（JSON 错误/字段缺失）返回 None 但记录备份。"""
+        tpl_file = self._template_file(name)
+        if not tpl_file.exists():
+            return None
+        try:
+            data = json.loads(tpl_file.read_text(encoding="utf-8"))
+            return ConfigTemplate.from_dict(data)
+        except (json.JSONDecodeError, OSError, KeyError, TypeError):
+            try:
+                backup = tpl_file.read_bytes()
+                (self.templates_dir / f"{name}.corrupted.bak").write_bytes(backup)
+            except Exception:
+                pass
+            return None
+
+    def list_templates(self) -> List[str]:
+        """按创建/更新时间倒序列出所有模板名称"""
+        idx = self._read_index()
+        return list(idx.get("templates", []))
+
+    def delete_template(self, name: str) -> None:
+        tpl_file = self._template_file(name)
+        if tpl_file.exists():
+            tpl_file.unlink()
+        idx = self._read_index()
+        if name in idx["templates"]:
+            idx["templates"].remove(name)
+        self._write_index(idx)
+
+    @classmethod
+    def validate_template_config(cls, config: Dict[str, Any]) -> List[str]:
+        """校验模板配置字段是否完整、合法。返回错误列表。"""
+        errors = []
+        if not isinstance(config, dict):
+            errors.append("配置必须是字典类型")
+            return errors
+
+        for field in cls.REQUIRED_CONFIG_FIELDS:
+            if field not in config:
+                errors.append(f"缺少必填字段: {field}")
+
+        action = config.get("action")
+        if action is not None and action not in ("copy", "move"):
+            errors.append(f"action 必须是 'copy' 或 'move'，当前为: {action}")
+
+        return errors
+
+
+class TemplateError(Exception):
+    pass
