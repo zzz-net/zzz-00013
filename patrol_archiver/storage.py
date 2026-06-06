@@ -1,4 +1,5 @@
 """批次状态持久化存储"""
+import hashlib
 import json
 import shutil
 import uuid
@@ -8,6 +9,28 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
+def file_signature(path: Path) -> Optional[str]:
+    """计算文件签名（大小+修改时间+前8KB MD5），用于判断文件是否被覆盖/篡改。
+    Executor 和 Auditor 都调用此函数以保证算法一致。"""
+    try:
+        if not path.exists() or not path.is_file():
+            return None
+        stat = path.stat()
+        size = stat.st_size
+        mtime = stat.st_mtime_ns
+        h = hashlib.md5()
+        h.update(f"{size}_{mtime}".encode("utf-8"))
+        try:
+            with open(path, "rb") as f:
+                chunk = f.read(min(8192, size))
+                h.update(chunk)
+        except Exception:
+            pass
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
 @dataclass
 class FileActionRecord:
     source: str
@@ -15,6 +38,7 @@ class FileActionRecord:
     action: str
     status: str  # "success", "failed", "pending"
     error: Optional[str] = None
+    source_signature: Optional[str] = None  # 源文件签名（大小+mtime+前8KB MD5，用于审计时验签
 
 
 @dataclass

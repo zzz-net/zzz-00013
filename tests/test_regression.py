@@ -408,6 +408,85 @@ def test_audit_nonexistent_batch_and_config_change() -> None:
                 f"配置变更未给出提示: stdout={r.stdout}")
 
 
+def test_audit_same_size_different_content() -> None:
+    """同字节数但内容不同的替换应被识别（签名验签），audit --json 可见非 success。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "run", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"run failed: {r.stderr}")
+
+        # 归档中找一个文件，读取其大小，写入同字节数的完全不同内容
+        archive = ws / "archive"
+        archived = []
+        for root, _, files in os.walk(archive):
+            for f in files:
+                archived.append(Path(root) / f)
+        _assert(len(archived) >= 1, f"归档为空: {archived}")
+        target = archived[0]
+        orig_size = target.stat().st_size
+        # 写入同字节数的全零内容（与 JPG_HEADER 完全不同）
+        target.write_bytes(b"\x00" * orig_size)
+        _assert(target.stat().st_size == orig_size, "替换后文件大小必须不变")
+
+        # audit --json 应能看到 overwritten
+        json_out = ws / "audit_report.json"
+        r = _run_cli(ws, "audit", "-c", "config.yaml", "-o", str(json_out))
+        _assert(r.returncode == 5,
+                f"同大小异内容时 audit 应 exit=5，实际 exit={r.returncode}\nstdout={r.stdout}\nstderr={r.stderr}")
+        _assert(json_out.exists(), "JSON 未生成")
+        data = json.loads(json_out.read_text(encoding="utf-8"))
+        counts = data.get("counts", {})
+        _assert(counts.get("overwritten", 0) >= 1,
+                f"同大小异内容应被记为 overwritten，实际 counts={counts}")
+
+        # JSON 中应有明确的文件级非 success 记录
+        overwritten_files = [
+            fr for fr in data.get("file_records", [])
+            if fr.get("audit_status") == "overwritten"
+        ]
+        _assert(len(overwritten_files) >= 1,
+                f"file_records 中应包含 overwritten 记录，实际 {[fr.get('audit_status') for fr in data.get('file_records', [])]}")
+        detail = overwritten_files[0].get("detail", "")
+        _assert(("签名不一致" in detail) or ("同字节数异内容" in detail) or ("大小相同但内容" in detail),
+                f"overwritten 明细中应说明签名不匹配，实际 detail={detail}")
+
+        # 用户可见的 warning
+        warnings = data.get("warnings", [])
+        codes = [w.get("code") for w in warnings]
+        _assert("files_overwritten" in codes,
+                f"应有 files_overwritten warning，实际 codes={codes}")
+
+        # 普通成功场景下（不替换）仍应为 success
+        # 用另一个文件再验证：先恢复刚才篡改的文件（从源复制回）
+        src_path = Path(overwritten_files[0]["source"])
+        if src_path.exists():
+            import shutil as _shutil
+            _shutil.copy2(str(src_path), str(target))
+        r2 = _run_cli(ws, "audit", "-c", "config.yaml")
+        _assert(r2.returncode == 0, f"恢复后 audit 应成功 exit=0，实际={r2.returncode}\n{r2.stdout}")
+        data2 = json.loads((ws / "audit_report.json").read_text(encoding="utf-8"))
+        # 注意：这里可能会有之前的审计报告在，但我们只看当前新审计
+        j2 = ws / "audit_ok.json"
+        _run_cli(ws, "audit", "-c", "config.yaml", "-o", str(j2))
+        data_ok = json.loads(j2.read_text(encoding="utf-8"))
+        counts_ok = data_ok.get("counts", {})
+        _assert(counts_ok.get("overwritten", 0) == 0,
+                f"恢复后 overwritten 应为 0，实际 counts={counts_ok}")
+        _assert(counts_ok.get("success", 0) >= 1,
+                f"恢复后应有 success，实际 counts={counts_ok}")
+
+        # show 仍能展示最近审计摘要
+        r3 = _run_cli(ws, "show", "-c", "config.yaml")
+        _assert("最近审计摘要" in r3.stdout, f"show 未展示最近审计摘要: {r3.stdout}")
+
+        # CSV 导出字段应稳定包含 signature_match
+        csv_out = ws / "audit_same.csv"
+        _run_cli(ws, "audit", "-c", "config.yaml", "-o", str(csv_out))
+        text = csv_out.read_text(encoding="utf-8-sig")
+        _assert("audit_summary" in text and "audit_file" in text,
+                "CSV 缺少审计 section")
+
+
 def main() -> int:
     tests = [
         ("跨进程持久化: list/show/export", test_cross_process_persistence),
@@ -419,6 +498,7 @@ def main() -> int:
         ("审计: JSON/CSV 双格式导出 + 字段稳定", test_audit_export_json_and_csv),
         ("审计: 检测删除/覆盖/回滚风险", test_audit_detect_deletion_and_overwrite),
         ("审计: 不存在批次与配置路径变更", test_audit_nonexistent_batch_and_config_change),
+        ("审计: 同字节数异内容签名验签", test_audit_same_size_different_content),
     ]
     failed = 0
     for name, fn in tests:

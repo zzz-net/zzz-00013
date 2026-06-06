@@ -1,5 +1,4 @@
 """批次对账审计：逐项比对状态记录与实际文件系统"""
-import hashlib
 import os
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -7,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from .storage import Batch, FileActionRecord, StateStore
+from .storage import Batch, FileActionRecord, StateStore, file_signature
 
 
 @dataclass
@@ -84,27 +83,6 @@ class AuditResult:
             extra_archive_files=list(data.get("extra_archive_files", [])),
             counts=dict(data.get("counts", {})),
         )
-
-
-def _file_signature(path: Path) -> Optional[str]:
-    """计算文件签名（大小+修改时间+前8KB MD5），用于判断文件是否被覆盖/篡改"""
-    try:
-        if not path.exists() or not path.is_file():
-            return None
-        stat = path.stat()
-        size = stat.st_size
-        mtime = stat.st_mtime_ns
-        h = hashlib.md5()
-        h.update(f"{size}_{mtime}".encode("utf-8"))
-        try:
-            with open(path, "rb") as f:
-                chunk = f.read(min(8192, size))
-                h.update(chunk)
-        except Exception:
-            pass
-        return h.hexdigest()
-    except Exception:
-        return None
 
 
 def _scan_archive_files(archive_dir: Path) -> List[Path]:
@@ -348,6 +326,7 @@ class Auditor:
             )
 
         # 以下是 original_status == "success" 的场景
+        signature_match: Optional[bool] = None
         if not tgt_exists:
             audit_status = "missing_in_archive"
             detail = "归档目标文件缺失（可能被手动删除/移动）"
@@ -359,30 +338,76 @@ class Auditor:
                     audit_status = "missing_in_source"
                     detail = "copy 动作记录成功，但源文件已不存在（可能被手动删除/move）"
                 else:
-                    # 两个都存在，对比大小判断是否被覆盖/篡改
+                    # 优先用签名比对（识别同大小异内容）
+                    recorded_sig = getattr(action, "source_signature", None)
                     try:
-                        src_stat = src.stat()
-                        tgt_stat = tgt.stat()
-                        if src_stat.st_size != tgt_stat.st_size:
-                            audit_status = "overwritten"
-                            detail = (
-                                f"目标文件大小与源不一致（源={src_stat.st_size}, "
-                                f"归档={tgt_stat.st_size}），可能被其他内容覆盖"
-                            )
+                        if recorded_sig:
+                            # 新批次：用签名严格比对
+                            tgt_sig = file_signature(tgt)
+                            if tgt_sig is None:
+                                audit_status = "tampered"
+                                detail = "无法读取归档文件签名"
+                                signature_match = False
+                            elif tgt_sig != recorded_sig:
+                                audit_status = "overwritten"
+                                signature_match = False
+                                src_stat = src.stat()
+                                tgt_stat = tgt.stat()
+                                if src_stat.st_size == tgt_stat.st_size:
+                                    detail = (
+                                        "归档目标文件与源签名不一致，文件大小相同但内容已被替换（同字节数异内容）"
+                                    )
+                                else:
+                                    detail = (
+                                        f"归档目标文件签名与源不一致（源={src_stat.st_size}B, "
+                                        f"归档={tgt_stat.st_size}B）"
+                                    )
+                            else:
+                                audit_status = "success"
+                                signature_match = True
+                                detail = "归档目标与源签名一致，文件完整"
                         else:
-                            audit_status = "success"
-                            detail = "文件存在且大小一致"
+                            # 老批次兼容：无签名记录，回退到大小比对
+                            src_stat = src.stat()
+                            tgt_stat = tgt.stat()
+                            if src_stat.st_size != tgt_stat.st_size:
+                                audit_status = "overwritten"
+                                signature_match = None
+                                detail = (
+                                    f"目标文件大小与源不一致（源={src_stat.st_size}, "
+                                    f"归档={tgt_stat.st_size}），可能被其他内容覆盖"
+                                    "（老批次无签名记录，无法做内容级验签）"
+                                )
+                            else:
+                                audit_status = "success"
+                                signature_match = None
+                                detail = "文件存在且大小一致（老批次无签名记录，未做内容级验签）"
                     except Exception as e:
                         audit_status = "tampered"
                         detail = f"无法读取文件属性进行比对: {e}"
             elif action.action == "move":
                 # move: 源应不存在，目标应存在
+                recorded_sig = getattr(action, "source_signature", None)
+                if recorded_sig:
+                    # move 动作签名校验：归档目标签名应与记录的源签名一致
+                    tgt_sig = file_signature(tgt)
+                    if tgt_sig and tgt_sig != recorded_sig:
+                        signature_match = False
+                        audit_status = "overwritten"
+                        detail = "归档目标签名与记录的源不一致，文件内容可能已被替换/篡改"
+                    elif tgt_sig is None:
+                        signature_match = False
+                        audit_status = "tampered"
+                        detail = "无法读取归档文件签名"
+                    else:
+                        signature_match = True
                 if src_exists:
-                    audit_status = "rollback_risk"
-                    detail = "move 动作记录成功，但源文件仍存在（可能被其他批次重新写入或回滚过）"
+                    if audit_status == "success":
+                        audit_status = "rollback_risk"
+                    detail = detail or "move 动作记录成功，但源文件仍存在（可能被其他批次重新写入或回滚过）"
                 else:
-                    audit_status = "success"
-                    detail = "move 状态正常（源已移走，归档存在）"
+                    if audit_status == "success":
+                        detail = detail or "move 状态正常（源已移走，归档存在且签名一致）"
 
         return FileAuditRecord(
             idx=idx,
@@ -394,4 +419,5 @@ class Auditor:
             detail=detail,
             source_exists=src_exists,
             archive_exists=tgt_exists,
+            signature_match=signature_match,
         )

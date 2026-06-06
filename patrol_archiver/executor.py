@@ -7,7 +7,7 @@ from typing import List
 
 from .config import ArchiverConfig
 from .planner import ArchivePlan, FileAction
-from .storage import Batch, FileActionRecord, PlanSummary, StateStore
+from .storage import Batch, FileActionRecord, PlanSummary, StateStore, file_signature
 
 
 class ExecutorError(Exception):
@@ -109,6 +109,9 @@ class Executor:
 
     def _execute_action(self, fa: FileAction) -> FileActionRecord:
         try:
+            # 在执行动作前先算源文件签名（move 之后源就不在了）
+            src_sig = file_signature(fa.source)
+
             fa.target.parent.mkdir(parents=True, exist_ok=True)
             if fa.target.exists():
                 raise FileExistsError(f"目标已存在: {fa.target}")
@@ -125,6 +128,7 @@ class Executor:
                 target=str(fa.target),
                 action=fa.action,
                 status="success",
+                source_signature=src_sig,
             )
         except Exception as e:
             return FileActionRecord(

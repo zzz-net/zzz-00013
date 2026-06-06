@@ -461,8 +461,8 @@ def audit_cmd(config_path: str, batch_id: str, json_out: bool, csv_out: bool, ou
             if len(result.extra_archive_files) > 20:
                 click.echo(f"  ... 省略 {len(result.extra_archive_files) - 20} 个")
 
-        if has_errors:
-            sys.exit(5)
+    if has_errors:
+        sys.exit(5)
 
 
 if __name__ == "__main__":

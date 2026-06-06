@@ -143,6 +143,7 @@ ACTION_FIELDS = [
     "source",
     "target",
     "error",
+    "source_signature",
 ]
 
 ISSUE_FIELDS = [
@@ -216,6 +217,7 @@ def export_csv_report(batch: Batch, output_path: Path) -> Path:
             a.source,
             a.target,
             a.error or "",
+            getattr(a, "source_signature", None) or "",
         ])
 
     ps = batch.plan_summary
