@@ -219,6 +219,117 @@ python -m patrol_archiver rollback -c _mv.yaml
 # 退出码 4
 ```
 
+---
+
+## 配置模板库复现步骤
+
+### 0. 准备环境
+
+```bash
+cd examples
+pip install -r ../requirements.txt
+```
+
+### 1. template-save 保存配置为命名模板
+
+```bash
+# 保存当前 config.yaml 为名为 "daily_patrol" 的模板，附描述
+python -m patrol_archiver template-save -c config.yaml -n daily_patrol -d "日常巡检归档配置（默认 copy 模式）"
+# 输出: 模板已保存: daily_patrol
+#       存储位置: .../.patrol_state/templates
+```
+
+同名模板默认拒绝覆盖：
+
+```bash
+python -m patrol_archiver template-save -c config.yaml -n daily_patrol
+# 输出: 错误: 模板 'daily_patrol' 已存在。使用 --force 强制覆盖。
+# 退出码 6
+
+# 带 --force 强制覆盖
+python -m patrol_archiver template-save -c config.yaml -n daily_patrol --force
+# 输出: 模板已覆盖保存: daily_patrol
+```
+
+### 2. template-list 列出所有模板
+
+```bash
+# 人类可读格式
+python -m patrol_archiver template-list -c config.yaml
+
+# --json 纯输出（可管道到 jq 等工具）
+python -m patrol_archiver template-list -c config.yaml --json
+
+# --csv 纯输出
+python -m patrol_archiver template-list -c config.yaml --csv
+```
+
+注意：`--json` 和 `--csv` 输出是纯净的，不夹杂"状态目录"等提示文本。
+
+### 3. template-show 查看单个模板详情
+
+```bash
+# 人类可读格式
+python -m patrol_archiver template-show -c config.yaml -n daily_patrol
+
+# --json 纯输出
+python -m patrol_archiver template-show -c config.yaml -n daily_patrol --json
+```
+
+不存在或损坏的模板会给出清晰错误：
+
+```bash
+python -m patrol_archiver template-show -c config.yaml -n no_such_template
+# 输出: 错误: 模板不存在: no_such_template
+# 退出码 7
+```
+
+### 4. template-export 导出模板（JSON / CSV）
+
+```bash
+# 导出单个模板为 JSON（按扩展名自动识别格式）
+python -m patrol_archiver template-export -c config.yaml -n daily_patrol -o daily_patrol.json
+
+# 导出单个模板为 CSV
+python -m patrol_archiver template-export -c config.yaml -n daily_patrol -o daily_patrol.csv
+
+# 不指定 -n 则导出全部模板
+python -m patrol_archiver template-export -c config.yaml -o all_templates.json
+python -m patrol_archiver template-export -c config.yaml -o all_templates.csv
+
+# 用 -f 显式指定格式（覆盖扩展名推断）
+python -m patrol_archiver template-export -c config.yaml -n daily_patrol -o daily_patrol.txt -f json
+```
+
+### 5. template-apply 从模板生成 YAML 配置
+
+```bash
+# 从 daily_patrol 模板生成新配置文件
+python -m patrol_archiver template-apply -s .patrol_state -n daily_patrol -c from_template.yaml
+
+# 输出文件已存在时默认拒绝覆盖
+python -m patrol_archiver template-apply -s .patrol_state -n daily_patrol -c from_template.yaml
+# 输出: 错误: 输出文件已存在: .../from_template.yaml。使用 --force 强制覆盖。
+# 退出码 6
+
+# 带 --force 强制覆盖
+python -m patrol_archiver template-apply -s .patrol_state -n daily_patrol -c from_template.yaml --force
+
+# 验证生成的配置能正常 dry-run
+python -m patrol_archiver dry-run -c from_template.yaml
+```
+
+`template-apply` 会在校验时：
+- 校验模板必填字段（`source_dir` / `archive_dir` / `csv_path` / `state_dir` / `action` / `target_pattern`）是否完整
+- 校验 `action` 是否为 `copy` 或 `move`
+- 校验 `target_pattern` 是否包含必要占位符 `{device_id}`/`{point}`/`{date}`/`{filename}`
+- 校验 `source_dir` 是否存在、`csv_path` 是否存在
+- 校验 `archive_dir` 父目录、输出目录、`state_dir` 是否可写
+- 路径问题仅以警告形式输出到 stderr，YAML 仍会生成（方便用户后续手动修正）
+- 字段缺失或非法则直接失败（退出码 8）
+
+---
+
 ## CLI 命令总览
 
 | 命令 | 说明 |
@@ -228,7 +339,10 @@ python -m patrol_archiver rollback -c _mv.yaml
 | `rollback -c CONFIG [-b BATCH_ID]` | 按批次回滚 |
 | `list -c CONFIG [-n N]` | 列出批次历史（持久化） |
 | `show -c CONFIG [-b BATCH_ID]` | 显示批次详情、配置摘要、动作日志 |
-| `export -c CONFIG [-b BATCH_ID] -o OUTPUT [-f json|csv|auto]` | 导出批次报告（JSON 或 CSV，默认按扩展名识别） |
+| `export -c CONFIG [-b BATCH_ID] -o OUTPUT [-f json\|csv\|auto]` | 导出批次报告（JSON 或 CSV，默认按扩展名识别） |
+| `doctor -c CONFIG [--json\|--csv]` | 配置体检：检查 YAML 和巡检 CSV 是否可用（dry-run/run 前推荐执行） |
+| `doctor-history -c CONFIG [-n N]` | 列出体检历史记录（跨重启可查） |
+| `doctor-export -c CONFIG [-d DOCTOR_ID] [-o OUTPUT] [-f json\|csv\|auto] [--json\|--csv]` | 导出体检记录为 JSON 或 CSV |
 
 ## 退出码
 
@@ -239,3 +353,4 @@ python -m patrol_archiver rollback -c _mv.yaml
 | 2 | 计划含致命错误（重复目标/路径冲突），run 被拒绝 |
 | 3 | 检测到重复执行已完成批次 |
 | 4 | 回滚冲突或失败 |
+| 10 | doctor 体检发现 error 级别问题 |

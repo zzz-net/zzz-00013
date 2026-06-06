@@ -927,6 +927,254 @@ def test_template_cross_process_persistence() -> None:
                 f"子进程3 应能读取模板详情: {r3.stdout}")
 
 
+def test_doctor_normal_success() -> None:
+    """doctor 正常场景：无错误，退出码 0，显示 info 级别检查项。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "doctor", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"doctor 正常应 exit=0，实际={r.returncode}\nstdout={r.stdout}\nstderr={r.stderr}")
+        _assert("体检 ID:" in r.stdout, f"doctor 未输出体检 ID: {r.stdout}")
+        _assert("[ERROR] 0" in r.stdout, f"正常 doctor 应显示 ERROR=0: {r.stdout}")
+        _assert("source_dir_ok" in r.stdout, f"正常 doctor 应包含 source_dir_ok: {r.stdout}")
+        _assert("csv_columns_ok" in r.stdout, f"正常 doctor 应包含 csv_columns_ok: {r.stdout}")
+        _assert("action_ok" in r.stdout, f"正常 doctor 应包含 action_ok: {r.stdout}")
+        _assert("target_pattern_ok" in r.stdout, f"正常 doctor 应包含 target_pattern_ok: {r.stdout}")
+        _assert("体检记录已保存到:" in r.stdout, f"doctor 应提示记录已保存: {r.stdout}")
+
+
+def test_doctor_missing_csv_columns_and_exit_nonzero() -> None:
+    """doctor CSV 缺列场景：应输出 error 并以非 0 退出码。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        bad_csv = ws / "bad_cols.csv"
+        bad_csv.write_text("设备编号,点位,日期\nDEV-A01,配电室,2026-06-01\n", encoding="utf-8-sig")
+        bad_cfg = ws / "bad_cfg.yaml"
+        import yaml
+        cfg = yaml.safe_load((ws / "config.yaml").read_text(encoding="utf-8"))
+        cfg["csv_path"] = "./bad_cols.csv"
+        bad_cfg.write_text(yaml.dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+        r = _run_cli(ws, "doctor", "-c", "bad_cfg.yaml")
+        _assert(r.returncode != 0, f"CSV 缺列 doctor 应 exit!=0，实际={r.returncode}\nstdout={r.stdout}")
+        _assert("csv_missing_columns" in r.stdout, f"应包含 csv_missing_columns: {r.stdout}")
+        _assert("[ERROR]" in r.stdout and "0" not in r.stdout.split("[ERROR]")[1].split()[0]
+                if "[ERROR]" in r.stdout else True,
+                f"CSV 缺列时 ERROR 计数应>0: {r.stdout}")
+        _assert("存在错误" in r.stdout, f"存在错误时应提示修复: {r.stdout}")
+
+
+def test_doctor_source_missing_and_state_writable() -> None:
+    """doctor 源目录不存在 + 其他检查项正常：正确分级。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        shutil.rmtree(ws / "source_photos")
+
+        r = _run_cli(ws, "doctor", "-c", "config.yaml")
+        _assert(r.returncode != 0, f"源目录缺失应 exit!=0: {r.returncode}")
+        _assert("source_dir_missing" in r.stdout, f"应包含 source_dir_missing: {r.stdout}")
+        _assert("state_dir_writable" in r.stdout, f"状态目录仍应正常检查: {r.stdout}")
+
+
+def test_doctor_pure_json_csv_no_hint_text() -> None:
+    """doctor --json / --csv 输出纯净，不夹杂提示文本。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "doctor", "-c", "config.yaml", "--json")
+        _assert(r.returncode == 0, f"doctor --json failed: {r.stderr}")
+        _assert("体检 ID" not in r.stdout and "体检记录已保存" not in r.stdout,
+                f"--json 输出不应包含中文提示: {r.stdout[:200]}")
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            _assert(False, f"--json 不是合法 JSON: {e}\n{r.stdout}")
+        _assert("doctor_id" in data and "issues" in data and "counts" in data,
+                f"JSON 缺少关键字段: {list(data.keys())}")
+        _assert(data["counts"]["error"] == 0, f"正常场景 error 应为 0: {data['counts']}")
+
+        r2 = _run_cli(ws, "doctor", "-c", "config.yaml", "--csv")
+        _assert(r2.returncode == 0, f"doctor --csv failed: {r2.stderr}")
+        _assert("体检 ID" not in r2.stdout, f"--csv 输出不应包含中文提示: {r2.stdout[:200]}")
+        rows = list(csv.reader(io.StringIO(r2.stdout)))
+        _assert(len(rows) >= 3, f"--csv 输出行数太少: {len(rows)}")
+        _assert("doctor_summary" in r2.stdout or "doctor_issue" in r2.stdout,
+                f"--csv 应包含 doctor section 标记: {r2.stdout[:200]}")
+
+
+def test_doctor_history_cross_process_persistence() -> None:
+    """doctor 历史记录跨进程/重启持久化，doctor-history 可列出。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r1 = _run_cli(ws, "doctor", "-c", "config.yaml")
+        _assert(r1.returncode == 0, f"doctor #1 failed: {r1.stderr}")
+
+        r2 = _run_cli(ws, "doctor", "-c", "config_bad_source.yaml")
+        _assert(r2.returncode != 0, f"doctor #2 应 fail: {r2.stdout}")
+
+        r3 = _run_cli(ws, "doctor-history", "-c", "config.yaml")
+        _assert(r3.returncode == 0, f"doctor-history failed: {r3.stderr}")
+        _assert("状态目录:" in r3.stdout, f"history 应显示状态目录: {r3.stdout}")
+        lines = [l for l in r3.stdout.splitlines() if l.strip().startswith("doctor_")]
+        _assert(len(lines) >= 2, f"history 应至少列出 2 次体检，实际 {len(lines)} 行:\n{r3.stdout}")
+        _assert("[PASS]" in r3.stdout and "[FAIL]" in r3.stdout,
+                f"history 应同时显示 PASS 和 FAIL: {r3.stdout}")
+
+
+def test_doctor_export_json_csv_stable_fields() -> None:
+    """doctor-export JSON/CSV 双格式导出，字段名稳定。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r = _run_cli(ws, "doctor", "-c", "config.yaml")
+        _assert(r.returncode == 0, f"doctor failed: {r.stderr}")
+
+        json_out = ws / "doctor_report.json"
+        r = _run_cli(ws, "doctor-export", "-c", "config.yaml", "-o", str(json_out))
+        _assert(r.returncode == 0, f"doctor-export json failed: {r.stderr}")
+        _assert(json_out.exists() and json_out.stat().st_size > 0, "JSON 报告未生成")
+        _assert("已导出体检报告" in r.stdout and "JSON" in r.stdout.upper(),
+                f"JSON 导出未提示格式: {r.stdout}")
+        data = json.loads(json_out.read_text(encoding="utf-8"))
+        for key in ("doctor_id", "created_at", "issues", "config_summary", "counts"):
+            _assert(key in data, f"JSON 缺少稳定字段 {key}")
+        _assert(isinstance(data["issues"], list) and len(data["issues"]) > 0,
+                "JSON issues 应为非空列表")
+        for ik in ("level", "code", "message"):
+            _assert(ik in data["issues"][0],
+                    f"JSON issues 缺少稳定字段 {ik}: {data['issues'][0]}")
+
+        csv_out = ws / "doctor_report.csv"
+        r = _run_cli(ws, "doctor-export", "-c", "config.yaml", "-o", str(csv_out))
+        _assert(r.returncode == 0, f"doctor-export csv failed: {r.stderr}")
+        _assert(csv_out.exists() and csv_out.stat().st_size > 0, "CSV 报告未生成")
+        _assert("[CSV]" in r.stdout.upper() or "csv" in r.stdout.lower(),
+                f"CSV 导出未提示格式: {r.stdout}")
+
+        text = csv_out.read_text(encoding="utf-8-sig")
+        rows = list(csv.reader(io.StringIO(text)))
+        sections = set()
+        for row in rows:
+            if row:
+                sections.add(row[0].strip())
+        for required in ("doctor_summary", "doctor_issue"):
+            _assert(required in sections,
+                    f"CSV 缺少 section={required}，实际 sections={sections}")
+
+        summary_header = rows[0]
+        for stable in ("doctor_id", "created_at", "error_count", "warn_count", "info_count"):
+            _assert(stable in summary_header,
+                    f"CSV summary 表头缺少稳定字段 {stable}: {summary_header}")
+
+        issue_header = None
+        for row in rows:
+            if row and row[0] == "section" and "level" in row and "code" in row:
+                issue_header = row
+                break
+        _assert(issue_header is not None, "未找到 doctor_issue 表头行")
+        for stable in ("section", "doctor_id", "idx", "level", "code", "message", "detail"):
+            _assert(stable in issue_header,
+                    f"CSV issue 表头缺少稳定字段 {stable}: {issue_header}")
+
+        csv2 = ws / "doctor_force.txt"
+        r = _run_cli(ws, "doctor-export", "-c", "config.yaml", "-o", str(csv2), "-f", "csv")
+        _assert(r.returncode == 0, f"doctor-export -f csv failed: {r.stderr}")
+        content = csv2.read_text(encoding="utf-8-sig")
+        _assert("doctor_summary" in content, "-f csv 未生成 CSV 内容")
+
+
+def test_doctor_export_stdout_pure_json_csv() -> None:
+    """doctor-export --json / --csv 输出到 stdout，纯净无提示。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        _run_cli(ws, "doctor", "-c", "config.yaml")
+
+        r = _run_cli(ws, "doctor-export", "-c", "config.yaml", "--json")
+        _assert(r.returncode == 0, f"doctor-export --json failed: {r.stderr}")
+        _assert("已导出体检报告" not in r.stdout and "体检记录已保存到" not in r.stdout,
+                f"--json 输出不应包含提示文本: {r.stdout[:200]}")
+        try:
+            data = json.loads(r.stdout)
+        except json.JSONDecodeError as e:
+            _assert(False, f"--json 输出不是合法 JSON: {e}\n{r.stdout}")
+        _assert("doctor_id" in data, f"JSON 缺少 doctor_id: {list(data.keys())}")
+
+        r2 = _run_cli(ws, "doctor-export", "-c", "config.yaml", "--csv")
+        _assert(r2.returncode == 0, f"doctor-export --csv failed: {r2.stderr}")
+        _assert("已导出体检报告" not in r2.stdout, f"--csv 输出不应包含提示文本: {r2.stdout[:200]}")
+        rows = list(csv.reader(io.StringIO(r2.stdout)))
+        _assert(len(rows) >= 3, f"--csv 输出行数太少: {len(rows)}")
+
+
+def test_doctor_same_second_name_collision() -> None:
+    """同一秒多次 doctor 运行：记录名不冲突，历史中都能查到。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+
+        from patrol_archiver.doctor import DoctorResult, CheckIssue
+        from patrol_archiver.storage import DoctorStore
+        store = DoctorStore(ws / ".patrol_state")
+
+        fixed_id = "doctor_20260101_120000_abc123"
+        r1 = DoctorResult(
+            doctor_id=fixed_id,
+            created_at="2026-01-01T12:00:00",
+            config_path=str(ws / "config.yaml"),
+            issues=[CheckIssue("info", "test", "first")],
+            config_summary={"action": "copy"},
+        )
+        r1_saved = store.save_doctor(r1)
+        _assert(r1_saved.doctor_id == fixed_id, f"首次应使用原始 ID: {r1_saved.doctor_id}")
+
+        r2 = DoctorResult(
+            doctor_id=fixed_id,
+            created_at="2026-01-01T12:00:00",
+            config_path=str(ws / "config.yaml"),
+            issues=[CheckIssue("info", "test", "second")],
+            config_summary={"action": "copy"},
+        )
+        r2_saved = store.save_doctor(r2)
+        _assert(r2_saved.doctor_id != fixed_id, f"第二次应生成唯一 ID: {r2_saved.doctor_id}")
+        _assert(r2_saved.doctor_id.startswith(fixed_id + "_"),
+                f"冲突 ID 应以原始 ID_ 为前缀: {r2_saved.doctor_id}")
+
+        r3 = DoctorResult(
+            doctor_id=fixed_id,
+            created_at="2026-01-01T12:00:00",
+            config_path=str(ws / "config.yaml"),
+            issues=[CheckIssue("info", "test", "third")],
+            config_summary={"action": "copy"},
+        )
+        r3_saved = store.save_doctor(r3)
+        _assert(r3_saved.doctor_id.startswith(fixed_id + "_"),
+                f"第三次也应加后缀: {r3_saved.doctor_id}")
+
+        ids = store.list_doctors()
+        _assert(len(ids) >= 3, f"应保存 3 条记录，实际 {len(ids)}")
+        _assert(store.get_doctor(r1_saved.doctor_id) is not None, "第一条记录应可读")
+        _assert(store.get_doctor(r2_saved.doctor_id) is not None, "第二条记录应可读")
+        _assert(store.get_doctor(r3_saved.doctor_id) is not None, "第三条记录应可读")
+
+
+def test_doctor_history_after_restart_and_export_by_id() -> None:
+    """doctor 记录跨重启后 doctor-history 和指定 ID 导出可用。"""
+    with tempfile.TemporaryDirectory() as td:
+        ws = _reset_workspace(Path(td))
+        r1 = _run_cli(ws, "doctor", "-c", "config.yaml")
+        _assert(r1.returncode == 0, f"doctor failed: {r1.stderr}")
+        import re
+        match = re.search(r"体检 ID:\s*(doctor_\S+)", r1.stdout)
+        _assert(match is not None, f"无法从 doctor 输出解析 ID: {r1.stdout}")
+        did = match.group(1)
+
+        r2 = _run_cli(ws, "doctor-history", "-c", "config.yaml")
+        _assert(r2.returncode == 0, f"doctor-history failed: {r2.stderr}")
+        _assert(did in r2.stdout, f"history 应包含首次体检 ID: {r2.stdout}")
+
+        json_out = ws / "by_id.json"
+        r3 = _run_cli(ws, "doctor-export", "-c", "config.yaml", "-d", did, "-o", str(json_out))
+        _assert(r3.returncode == 0, f"doctor-export by id failed: {r3.stderr}")
+        data = json.loads(json_out.read_text(encoding="utf-8"))
+        _assert(data["doctor_id"] == did, f"导出的 ID 不匹配: {data['doctor_id']} vs {did}")
+
+
 def main() -> int:
     tests = [
         ("跨进程持久化: list/show/export", test_cross_process_persistence),
@@ -955,6 +1203,15 @@ def main() -> int:
         ("模板: 损坏/缺失/不存在错误处理", test_template_bad_data_and_corruption),
         ("模板: list --json/--csv 纯输出无提示", test_template_list_pure_json_csv_output),
         ("模板: 跨进程/重启持久化", test_template_cross_process_persistence),
+        ("体检: 正常场景成功 + INFO 检查项", test_doctor_normal_success),
+        ("体检: CSV 缺列 + 非 0 退出码", test_doctor_missing_csv_columns_and_exit_nonzero),
+        ("体检: 源目录缺失 + 状态目录可写分级正确", test_doctor_source_missing_and_state_writable),
+        ("体检: --json/--csv 纯输出无提示文本", test_doctor_pure_json_csv_no_hint_text),
+        ("体检: 跨进程/重启历史持久化", test_doctor_history_cross_process_persistence),
+        ("体检: export JSON/CSV 双格式稳定字段", test_doctor_export_json_csv_stable_fields),
+        ("体检: doctor-export --json/--csv stdout 纯输出", test_doctor_export_stdout_pure_json_csv),
+        ("体检: 同一秒多次运行记录名不冲突", test_doctor_same_second_name_collision),
+        ("体检: history 与按 ID 导出", test_doctor_history_after_restart_and_export_by_id),
     ]
     failed = 0
     for name, fn in tests:

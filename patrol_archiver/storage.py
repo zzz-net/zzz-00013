@@ -445,3 +445,103 @@ class TemplateStore:
 
 class TemplateError(Exception):
     pass
+
+
+class DoctorStore:
+    """体检记录持久化存储：保存在 state_dir/doctors 下"""
+
+    def __init__(self, state_dir: Path):
+        self.state_dir = Path(state_dir)
+        self.doctors_dir = self.state_dir / "doctors"
+        self.index_file = self.doctors_dir / "index.json"
+        self._ensure_dirs()
+
+    def _ensure_dirs(self) -> None:
+        self.doctors_dir.mkdir(parents=True, exist_ok=True)
+        if not self.index_file.exists():
+            self._write_index({"doctors": [], "last_doctor_id": None})
+
+    def _read_index(self) -> Dict[str, Any]:
+        try:
+            raw = self.index_file.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (json.JSONDecodeError, FileNotFoundError, OSError):
+            data = {"doctors": [], "last_doctor_id": None}
+            try:
+                self._write_index(data)
+            except Exception:
+                pass
+        data.setdefault("doctors", [])
+        data.setdefault("last_doctor_id", None)
+        return data
+
+    def _write_index(self, data: Dict[str, Any]) -> None:
+        self.index_file.parent.mkdir(parents=True, exist_ok=True)
+        self.index_file.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+
+    def _doctor_file(self, doctor_id: str) -> Path:
+        return self.doctors_dir / f"{doctor_id}.json"
+
+    def _resolve_unique_id(self, base_id: str) -> str:
+        """处理同一秒多次运行的记录名冲突，追加后缀直到唯一"""
+        if not self._doctor_file(base_id).exists():
+            return base_id
+        suffix = 1
+        while True:
+            candidate = f"{base_id}_{suffix}"
+            if not self._doctor_file(candidate).exists():
+                return candidate
+            suffix += 1
+
+    def save_doctor(self, result: Any) -> Any:
+        """保存体检结果。处理同一秒多次运行的记录名冲突"""
+        from .doctor import DoctorResult
+        original_id = result.doctor_id
+        unique_id = self._resolve_unique_id(original_id)
+        if unique_id != original_id:
+            result.doctor_id = unique_id
+
+        f = self._doctor_file(result.doctor_id)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(
+            json.dumps(result.to_dict(), ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+        idx = self._read_index()
+        if result.doctor_id not in idx["doctors"]:
+            idx["doctors"].insert(0, result.doctor_id)
+        idx["last_doctor_id"] = result.doctor_id
+        self._write_index(idx)
+        return result
+
+    def get_doctor(self, doctor_id: str) -> Optional[Any]:
+        """读取指定体检 ID 的结果"""
+        from .doctor import DoctorResult
+        f = self._doctor_file(doctor_id)
+        if not f.exists():
+            return None
+        try:
+            data = json.loads(f.read_text(encoding="utf-8"))
+            return DoctorResult.from_dict(data)
+        except (json.JSONDecodeError, OSError, KeyError, TypeError):
+            return None
+
+    def list_doctors(self) -> List[str]:
+        """按时间倒序列出所有体检 ID"""
+        idx = self._read_index()
+        return list(idx.get("doctors", []))
+
+    def get_last_doctor_id(self) -> Optional[str]:
+        """获取最近一次体检 ID"""
+        idx = self._read_index()
+        return idx.get("last_doctor_id")
+
+    def get_last_doctor(self) -> Optional[Any]:
+        """获取最近一次体检结果"""
+        did = self.get_last_doctor_id()
+        if not did:
+            return None
+        return self.get_doctor(did)

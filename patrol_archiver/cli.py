@@ -52,12 +52,19 @@ STATUS_MARKS = {
 
 from .config import ArchiverConfig, load_config
 from .csv_parser import parse_patrol_csv
+from .doctor import (
+    DoctorResult,
+    format_doctor_history,
+    format_doctor_result,
+    run_doctor_checks,
+)
 from .executor import Executor, ExecutorError
 from .planner import generate_plan
 from .rollback import (
     RollbackError,
     detect_format,
     export_audit_report,
+    export_doctor_report,
     export_report,
     export_template_csv,
     export_template_json,
@@ -71,7 +78,7 @@ from .rollback import (
     format_template_show,
     rollback_batch,
 )
-from .storage import StateStore, TemplateStore, TemplateError
+from .storage import DoctorStore, StateStore, TemplateStore, TemplateError
 from .auditor import Auditor, AuditResult
 
 
@@ -836,6 +843,155 @@ def template_apply_cmd(config_path: str, state_dir_path: str, name: str, force: 
     click.echo(f"已从模板 '{name}' 生成配置: {out_path}")
     if path_errors:
         click.echo("注意: 上述路径问题需手动修复后再执行 run/dry-run。", err=True)
+
+
+@main.command("doctor")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径")
+@click.option("--json", "json_out", is_flag=True, default=False, help="以 JSON 格式输出到 stdout（不写文件）")
+@click.option("--csv", "csv_out", is_flag=True, default=False, help="以 CSV 格式输出到 stdout（不写文件）")
+def doctor_cmd(config_path: str, json_out: bool, csv_out: bool) -> None:
+    """配置体检：检查 YAML 和巡检 CSV 是否可用（dry-run/run 前推荐执行）"""
+    pure_output = json_out or csv_out
+
+    try:
+        cfg_path_obj = _resolve_config_path(config_path)
+    except click.ClickException as e:
+        click.echo(f"错误: {e}", err=True)
+        sys.exit(1)
+
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        click.echo(f"错误: 加载配置失败 - {e}", err=True)
+        sys.exit(1)
+
+    result = run_doctor_checks(cfg, config_path)
+
+    try:
+        store = DoctorStore(cfg.state_dir)
+        result = store.save_doctor(result)
+    except Exception as e:
+        if not pure_output:
+            click.echo(f"警告: 保存体检记录失败 - {e}", err=True)
+
+    if json_out:
+        import json as _json
+        click.echo(_json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+    elif csv_out:
+        import tempfile
+        from .rollback import export_doctor_csv
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", encoding="utf-8-sig") as tf:
+            tmp_path = Path(tf.name)
+        try:
+            export_doctor_csv(result, tmp_path)
+            click.echo(tmp_path.read_text(encoding="utf-8-sig"))
+        finally:
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+    else:
+        click.echo(format_doctor_result(result))
+        try:
+            click.echo(f"\n体检记录已保存到: {cfg.state_dir / 'doctors'}")
+        except Exception:
+            pass
+
+    if result.has_errors:
+        sys.exit(10)
+
+
+@main.command("doctor-history")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径（用于读取 state_dir）")
+@click.option("-n", "--limit", type=int, default=20, help="显示最近 N 条")
+def doctor_history_cmd(config_path: str, limit: int) -> None:
+    """列出体检历史记录（跨重启可查）"""
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        click.echo(f"错误: 加载配置失败 - {e}", err=True)
+        sys.exit(1)
+
+    store = DoctorStore(cfg.state_dir)
+    ids = store.list_doctors()[:limit]
+    results = [r for r in (store.get_doctor(i) for i in ids) if r is not None]
+    click.echo(f"状态目录: {cfg.state_dir}")
+    click.echo(f"体检记录存储: {store.doctors_dir}")
+    click.echo(f"共 {len(ids)} 次体检（显示最近 {len(results)} 次）:")
+    click.echo("")
+    click.echo(format_doctor_history(results))
+
+
+@main.command("doctor-export")
+@click.option("-c", "--config", "config_path", required=True, help="YAML 配置文件路径（用于读取 state_dir）")
+@click.option("-d", "--doctor", "doctor_id", default=None, help="体检 ID，不指定则使用最近一次")
+@click.option("-o", "--output", "output_path", default=None, help="导出文件路径 (.json 或 .csv)")
+@click.option(
+    "-f", "--format", "fmt",
+    type=click.Choice(["json", "csv", "auto"], case_sensitive=False),
+    default="auto",
+    help="导出格式：json / csv / auto（按扩展名自动识别，默认 auto）"
+)
+@click.option("--json", "json_stdout", is_flag=True, default=False, help="以 JSON 格式输出到 stdout（不写文件，纯输出）")
+@click.option("--csv", "csv_stdout", is_flag=True, default=False, help="以 CSV 格式输出到 stdout（不写文件，纯输出）")
+def doctor_export_cmd(
+    config_path: str, doctor_id: str, output_path: str, fmt: str,
+    json_stdout: bool, csv_stdout: bool
+) -> None:
+    """导出体检记录为 JSON 或 CSV"""
+    pure_output = json_stdout or csv_stdout
+
+    if not pure_output and not output_path:
+        raise click.UsageError("缺少 '-o/--output'，或使用 '--json' / '--csv' 输出到 stdout")
+
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        click.echo(f"错误: 加载配置失败 - {e}", err=True)
+        sys.exit(1)
+
+    store = DoctorStore(cfg.state_dir)
+
+    if not doctor_id:
+        doctor_id = store.get_last_doctor_id()
+        if not doctor_id:
+            click.echo("错误: 未找到任何体检记录", err=True)
+            sys.exit(1)
+
+    result = store.get_doctor(doctor_id)
+    if result is None:
+        click.echo(f"错误: 体检记录不存在: {doctor_id}", err=True)
+        sys.exit(1)
+
+    if json_stdout:
+        import json as _json
+        click.echo(_json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+        return
+    if csv_stdout:
+        import tempfile
+        from .rollback import export_doctor_csv
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False, mode="w", encoding="utf-8-sig") as tf:
+            tmp_path = Path(tf.name)
+        try:
+            export_doctor_csv(result, tmp_path)
+            click.echo(tmp_path.read_text(encoding="utf-8-sig"))
+        finally:
+            try:
+                tmp_path.unlink()
+            except Exception:
+                pass
+        return
+
+    resolved_fmt = None if fmt.lower() == "auto" else fmt.lower()
+    actual_fmt = resolved_fmt or detect_format(Path(output_path))
+
+    try:
+        out = export_doctor_report(result, Path(output_path), fmt=resolved_fmt)
+    except Exception as e:
+        click.echo(f"错误: 导出失败 - {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"已导出体检报告 [{actual_fmt.upper()}] 到: {out}")
 
 
 if __name__ == "__main__":

@@ -753,3 +753,107 @@ def format_template_show(template: Any) -> str:
         else:
             lines.append(f"  {key}: {value}")
     return "\n".join(lines)
+
+
+DOCTOR_SUMMARY_FIELDS = [
+    "doctor_id",
+    "created_at",
+    "config_path",
+    "error_count",
+    "warn_count",
+    "info_count",
+    "has_errors",
+    "source_dir",
+    "archive_dir",
+    "csv_path",
+    "state_dir",
+    "action",
+    "target_pattern",
+]
+
+DOCTOR_ISSUE_FIELDS = [
+    "section",
+    "doctor_id",
+    "idx",
+    "level",
+    "code",
+    "message",
+    "detail",
+]
+
+
+def _build_doctor_summary_row(result: Any) -> dict:
+    from .doctor import DoctorResult
+    counts = {
+        "error": len(result.errors),
+        "warn": len(result.warnings),
+        "info": len(result.infos),
+    }
+    cfg = result.config_summary or {}
+    return {
+        "doctor_id": result.doctor_id,
+        "created_at": result.created_at,
+        "config_path": result.config_path,
+        "error_count": counts["error"],
+        "warn_count": counts["warn"],
+        "info_count": counts["info"],
+        "has_errors": "true" if result.has_errors else "false",
+        "source_dir": cfg.get("source_dir", ""),
+        "archive_dir": cfg.get("archive_dir", ""),
+        "csv_path": cfg.get("csv_path", ""),
+        "state_dir": cfg.get("state_dir", ""),
+        "action": cfg.get("action", ""),
+        "target_pattern": cfg.get("target_pattern", ""),
+    }
+
+
+def export_doctor_csv(result: Any, output_path: Path) -> Path:
+    """导出体检结果为 CSV：包含 summary 和 issue 两段"""
+    from .doctor import DoctorResult
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, lineterminator="\n")
+
+    summary = _build_doctor_summary_row(result)
+    writer.writerow(["section"] + DOCTOR_SUMMARY_FIELDS)
+    writer.writerow(["doctor_summary"] + [summary.get(k, "") for k in DOCTOR_SUMMARY_FIELDS])
+    writer.writerow([])
+
+    writer.writerow(DOCTOR_ISSUE_FIELDS)
+    for idx, issue in enumerate(result.issues, start=1):
+        writer.writerow([
+            "doctor_issue",
+            result.doctor_id,
+            idx,
+            issue.level,
+            issue.code,
+            issue.message,
+            issue.detail or "",
+        ])
+
+    output_path.write_text(buf.getvalue(), encoding="utf-8-sig")
+    return output_path
+
+
+def export_doctor_json(result: Any, output_path: Path) -> Path:
+    """导出体检结果为 JSON"""
+    from .doctor import DoctorResult
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(
+        json.dumps(result.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+    return output_path
+
+
+def export_doctor_report(result: Any, output_path: Path, fmt: Optional[str] = None) -> Path:
+    """导出体检报告。fmt=None 时按扩展名自动识别（json/csv）"""
+    fmt = (fmt or detect_format(output_path)).lower()
+    if fmt == "csv":
+        return export_doctor_csv(result, output_path)
+    if fmt == "json":
+        return export_doctor_json(result, output_path)
+    raise ValueError(f"不支持的体检导出格式: {fmt}，请使用 json 或 csv")
