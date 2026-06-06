@@ -1,0 +1,2 @@
+[console_scripts]
+patrol-archiver = patrol_archiver.cli:main

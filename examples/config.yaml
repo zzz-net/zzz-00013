@@ -1,0 +1,26 @@
+# 巡检照片归档配置示例
+source_dir: "./source_photos"
+archive_dir: "./archive"
+csv_path: "./patrol.csv"
+state_dir: "./.patrol_state"
+
+# copy 或 move
+action: "copy"
+
+# 目标路径模板，可用占位符: {device_id}, {point}, {date}, {filename}
+target_pattern: "{device_id}/{point}/{date}/{filename}"
+
+# 支持的照片扩展名
+photo_extensions:
+  - ".jpg"
+  - ".jpeg"
+  - ".png"
+  - ".bmp"
+  - ".gif"
+
+# CSV 列名映射（若 CSV 用中文列名）
+csv_columns:
+  device_id: "设备编号"
+  point: "点位"
+  date: "日期"
+  photo_name: "照片名"

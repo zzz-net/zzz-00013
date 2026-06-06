@@ -1,0 +1,6 @@
+source_dir: "./nonexistent_source"
+archive_dir: "./archive"
+csv_path: "./patrol.csv"
+state_dir: "./.patrol_state"
+action: "copy"
+target_pattern: "{device_id}/{point}/{date}/{filename}"
